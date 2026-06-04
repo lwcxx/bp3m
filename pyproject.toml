@@ -47,6 +47,9 @@ jax = ["jax", "jaxlib"]
 bp3m = "bp3m_run:main"
 bp3m-setup = "bp3m.setup:main"
 
+[tool.setuptools]
+py-modules = ["bp3m_run"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 
