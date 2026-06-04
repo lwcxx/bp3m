@@ -779,6 +779,17 @@ def main():
                 plot_influence=args.plot_influence,
             )
 
+    # Save the command only on successful completion so interrupted runs
+    # do not overwrite the record of the last successful invocation.
+    import shlex as _shlex
+    from datetime import datetime as _datetime
+    _cmd_file = output_dir / field / 'bp3m_command.txt'
+    _cmd_file.parent.mkdir(parents=True, exist_ok=True)
+    _cmd_file.write_text(
+        f"# {_datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        + ' '.join(_shlex.quote(a) for a in sys.argv) + '\n'
+    )
+
     print("\n" + "=" * 55)
     print("Pipeline complete.")
     if args.test_synthetic:
