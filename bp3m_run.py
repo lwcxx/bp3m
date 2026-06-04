@@ -6,16 +6,13 @@ measure improved proper motions.
 Usage examples
 --------------
 # By target name (Simbad-resolved):
-  python bp3m_run.py \\
-      --name "Sculptor dSph" --lib_dir ./lib
+  bp3m --name "Sculptor dSph" --lib_dir ./lib
 
 # By coordinates:
-  conda run -n pymc_new python gaiahub_improved.py \\
-      --ra 15.039 --dec -33.709 --search_radius 0.3 --lib_dir ./lib
+  bp3m --ra 15.039 --dec -33.709 --search_radius 0.3 --lib_dir ./lib
 
 # Resume after cross-match (e.g. to re-run alignment with different params):
-  conda run -n pymc_new python gaiahub_improved.py \\
-      --name "Sculptor dSph" --lib_dir ./lib \\
+  bp3m --name "Sculptor dSph" --lib_dir ./lib \\
       --skip_download --skip_psf --skip_crossmatch \\
       --n_bp3m_iter 30 --bp3m_clip_sigma 3.5
 
@@ -58,7 +55,7 @@ def _config_lib_dir() -> str | None:
 
 def _parse_args():
     p = argparse.ArgumentParser(
-        prog='gaiahub_improved',
+        prog='bp3m',
         description='Measure proper motions by combining Gaia + HST data.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
