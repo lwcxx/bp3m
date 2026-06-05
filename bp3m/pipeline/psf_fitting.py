@@ -1202,6 +1202,7 @@ def run_psf_fitting(
     verbose: bool = True,
     force_refit: bool = False,
     clean_psf: bool = False,
+    apply_psf_delta: bool = False,
     n_psf_iter: int | None = None,
     restrict_to_obsids: list[str] | None = None,
     psf_dir: Path | None = None,
@@ -1226,10 +1227,11 @@ def run_psf_fitting(
     current call.
 
     PSF iteration logic (per image):
-      - Default: 1 iteration with bare stdpsf (``clean_psf=False``) or with the
-          stored cumulative δP if ``psf_delta.npy`` exists.
-      - ``clean_psf=True`` always starts from the bare stdpsf, ignoring any
-          stored δP.  Default 1 iteration.
+      - Default: 1 iteration from the bare stdpsf (ignores any stored δP).
+      - ``apply_psf_delta=True`` loads the stored ``psf_delta.npy`` (if present)
+          and uses it as the starting PSF model for the first iteration.
+      - ``clean_psf=True`` always uses the bare stdpsf, overriding
+          ``apply_psf_delta``.
       - ``n_psf_iter=N`` explicitly sets the number of iterations.  Pass
           ``n_psf_iter=2`` to enable the iterative PSF correction (fit → measure
           δP → re-fit with corrected PSF).  WARNING: applying the measured δP
@@ -1245,9 +1247,10 @@ def run_psf_fitting(
     telescope    : 'HST' (JWST support coming)
     im_type      : '_flc' or '_flt'
     n_processes  : cores for py1pass internal parallelism (-1 = all, default)
-    force_refit  : re-fit even if catalog and matching params already exist
-    clean_psf    : ignore stored psf_delta.npy; start from bare stdpsf
-    n_psf_iter   : explicit number of PSF fitting iterations (overrides default)
+    force_refit      : re-fit even if catalog and matching params already exist
+    clean_psf        : ignore stored psf_delta.npy; start from bare stdpsf (overrides apply_psf_delta)
+    apply_psf_delta  : load stored psf_delta.npy (if present) as starting PSF model
+    n_psf_iter       : explicit number of PSF fitting iterations (overrides default)
     psf_dir      : unused (pypass is installed as a package); kept for API compatibility
 
     Returns
@@ -1415,11 +1418,11 @@ def run_psf_fitting(
         # aliasing that degrades the 2-D pixel-phase distribution for sparse fields.
         #
         # Rules for initial_delta (which PSF to fit with):
-        #   clean_psf=True  → always bare stdpsf, no delta loaded
-        #   force_refit=True → bare stdpsf (re-fitting from scratch; use --n_psf_iter 2
-        #                       explicitly if you want to apply a stored delta)
-        #   otherwise        → load stored delta if psf_delta.npy exists on disk
-        use_clean = clean_psf or (force_refit and n_psf_iter is None)
+        #   Default              → bare stdpsf (use_clean=True)
+        #   apply_psf_delta=True → load stored delta if psf_delta.npy exists
+        #   clean_psf=True       → always bare stdpsf, overrides apply_psf_delta
+        #   force_refit=True     → bare stdpsf (re-fitting from scratch)
+        use_clean = clean_psf or (not apply_psf_delta) or force_refit
         if use_clean:
             initial_delta = None
         else:
@@ -1446,10 +1449,12 @@ def run_psf_fitting(
             print(f"   PSF model  : CORRECTED  (stored δP, cumulative peak = {peak:+.5f})")
         elif clean_psf:
             print(f"   PSF model  : BARE stdpsf  (--clean_psf)")
-        elif force_refit and n_psf_iter is None:
-            print(f"   PSF model  : BARE stdpsf  (--force_refit_psf; pass --n_psf_iter 2 to apply stored δP)")
+        elif force_refit:
+            print(f"   PSF model  : BARE stdpsf  (--force_refit_psf)")
+        elif apply_psf_delta:
+            print(f"   PSF model  : BARE stdpsf  (--apply_psf_delta specified but no psf_delta.npy found)")
         else:
-            print(f"   PSF model  : BARE stdpsf  (no stored δP found)")
+            print(f"   PSF model  : BARE stdpsf  (default)")
         print(f"   Iterations : {n_img_iter}")
 
         current_delta = initial_delta

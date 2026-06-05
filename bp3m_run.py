@@ -285,7 +285,11 @@ def _parse_args():
                           'stored delta in the second iteration.')
     ctl.add_argument('--clean_psf', action='store_true',
                      help='Start PSF fitting from the bare stdpsf, ignoring any stored '
-                          'psf_delta.npy.')
+                          'psf_delta.npy. Overrides --apply_psf_delta.')
+    ctl.add_argument('--apply_psf_delta', action='store_true',
+                     help='Load the stored psf_delta.npy (if present) as the starting PSF '
+                          'model for the first fitting iteration. By default the bare stdpsf '
+                          'is always used.')
     ctl.add_argument('--n_psf_iter', type=int, default=None,
                      help='Number of iterative PSF fitting passes (default: 1). Pass 2 to '
                           'enable the iterative PSF correction (fit → measure δP → re-fit '
@@ -605,6 +609,7 @@ def main():
             verbose=not args.quiet,
             force_refit=args.force_refit_psf,
             clean_psf=args.clean_psf,
+            apply_psf_delta=args.apply_psf_delta,
             n_psf_iter=args.n_psf_iter,
             fmin=args.fmin, fmin_thresh=args.fmin_thresh, mag_st_max=args.mag_st_max, hmin=args.hmin,
             n_passes=args.n_passes, n_discovery_passes=args.n_discovery_passes,
