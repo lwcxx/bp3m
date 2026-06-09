@@ -2658,6 +2658,11 @@ def _measure_astrometry_proper(
             gaia_g_mag = float(gaia_row.get('gmag', 20.0))
             if not np.isfinite(gaia_g_mag):
                 gaia_g_mag = 20.0
+            if sid_int in _DEBUG_IDS:
+                print(f"  [DEBUG2] sid={sid_int} has_full_gaia_astrometry={has_full_gaia_astrometry} "
+                      f"pmra_g={pmra_g:.4f} C_gaia_is_None={C_gaia is None} "
+                      f"pmra_err={gaia_row.get('pmra_error', 'MISSING')} "
+                      f"ra_err={gaia_row.get('ra_error', 'MISSING')}", flush=True)
         else:
             ra_g = dec_g = pmra_g = pmdec_g = plx_g = 0.0
             C_gaia = None
@@ -2979,6 +2984,11 @@ def _measure_astrometry_proper(
         # Null out PM if its uncertainty exceeds _SIGMA_PM_DIFFUSE/10 (10 mas/yr) —
         # below this threshold the measurement is not useful for most science.
         _pm_null = sigma_pmra >= _SIGMA_PM_DIFFUSE / 10.0 or sigma_pmdec >= _SIGMA_PM_DIFFUSE / 10.0
+        if sid_int in _DEBUG_IDS:
+            print(f"  [DEBUG3] sid={sid_int} N_fit={fit['N']} "
+                  f"sigma_pmra={sigma_pmra:.4f} sigma_ra={float(np.sqrt(max(C_u[0,0],0.))):.4f} "
+                  f"pmra_out={pmra_out:.4f} pm_null={_pm_null} "
+                  f"has_full_gaia={has_full_gaia_astrometry}", flush=True)
         if _pm_null:
             pmra_out = pmdec_out = np.nan
             sigma_pmra = sigma_pmdec = corr_pm = np.nan
