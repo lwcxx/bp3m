@@ -65,7 +65,7 @@ def _match_one(args):
 
         process_single_image(
             hst_dict, gaia_df,
-            hst_pix_floor=kwargs.get('hst_pix_floor', 0.01),
+            hst_pix_floor=kwargs.get('hst_pix_floor', 0.05),
             min_matches=kwargs.get('min_matches', 3),
             zero_pm=kwargs.get('zero_pm', False),
             max_mag_diff=kwargs.get('max_mag_diff', 3.0),
