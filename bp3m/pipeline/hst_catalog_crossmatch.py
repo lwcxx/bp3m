@@ -1428,7 +1428,7 @@ def _within_filter_match(
         _ZP_MIN_MASTER = 500   # master sources required
         _ZP_MIN_IMG    = 50    # star candidates required in current image
         _ZP_MIN_INLIER = 30    # mode-inliers required
-        _ZP_MAX_CORR   = 1.0
+        _ZP_MAX_CORR   = 0.0 if pre_zp_applied else 1.0
 
         for sub_name in remaining:
             cur_mask = fdf['sub_name'].values == sub_name
