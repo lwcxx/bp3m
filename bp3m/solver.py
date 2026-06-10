@@ -1904,6 +1904,99 @@ class BP3MSolver:
             }
         return result
 
+    def compute_gdc_residuals(self, r_hat, v_hat, C_r=None, C_vT=None):
+        """
+        Compute per-detection residuals and full covariance in each image's
+        local GDC pixel frame.
+
+        The pseudo-image residual (xys - pred) is back-projected through J⁻¹
+        to the GDC-corrected HST pixel frame.  The full covariance propagates
+        three contributions back to the same frame:
+
+            C_gdc_total = J⁻¹ @ C_total_pseudo @ J⁻¹ᵀ
+
+        where in pseudo-image space:
+            C_total_pseudo = C_s  +  JU C_vT JUᵀ  +  X C_r_j Xᵀ
+
+        C_hst (measurement-only, already in GDC frame) is also saved separately.
+
+        Parameters
+        ----------
+        r_hat  : (n_r,)          MAP image transformation vector
+        v_hat  : (n_stars, 5)    MAP stellar astrometry
+        C_r    : (n_r, n_r) or None   alignment parameter covariance
+        C_vT   : (n_stars, 5, 5) or None   conditional stellar astrometry cov
+
+        Returns a dict keyed by image name.  Each value is a dict with:
+            'X_c'           : (n,) centered GDC pixel x  (= X - Xo)
+            'Y_c'           : (n,) centered GDC pixel y  (= Y - Yo)
+            'dx_gdc'        : (n,) x residual in GDC frame [pixels]
+            'dy_gdc'        : (n,) y residual in GDC frame [pixels]
+            'C_hst'         : (n, 2, 2) measurement-only covariance in GDC frame
+            'C_gdc_total'   : (n, 2, 2) full covariance in GDC frame
+                              (= C_hst when C_r and C_vT are both None)
+            'sidx'          : (n,) indices into stellar_astrometry rows
+            'use_for_fit'   : (n,) bool — used for transformation fitting
+            'use_for_astrom': (n,) bool — used for stellar astrometry
+        """
+        result = {}
+        nr = self.N_R
+        for j_idx, img in enumerate(self.image_names):
+            d = self._img_data.get(img)
+            if d is None:
+                continue
+            cs    = j_idx * nr
+            r_j   = r_hat[cs:cs + nr]
+            sidx  = d["sidx"]
+            X_mat = d["X_mat"]   # (n, 2, N_R)
+            JU    = d["JU"]      # (n, 2, 5)
+            xys   = d["xys"]     # (n, 2) — Gaia pseudo-image positions
+
+            # Pseudo-image residual: xys - (X r_j - JU v_hat_i)
+            pred         = (np.einsum('nij,j->ni', X_mat, r_j)
+                            - np.einsum('nij,nj->ni', JU, v_hat[sidx]))
+            resid_pseudo = xys - pred    # (n, 2)
+
+            # Total covariance in pseudo-image frame
+            C_total = self._compute_Cs(img, r_j)             # (n, 2, 2) = J C_hst Jᵀ
+            if C_vT is not None:
+                C_total = C_total + np.einsum(
+                    'nik,nkl,njl->nij', JU, C_vT[sidx], JU)
+            if C_r is not None:
+                C_r_j   = C_r[cs:cs + nr, cs:cs + nr]
+                C_total = C_total + np.einsum(
+                    'nik,kl,njl->nij', X_mat, C_r_j, X_mat)
+
+            # Jacobian and inverse; back-project residual and covariance to GDC frame
+            if self.poly_order == 1:
+                J     = self.R[img]                          # (2, 2) constant
+                J_inv = np.linalg.inv(J)                     # (2, 2)
+                dxy   = resid_pseudo @ J_inv.T               # (n, 2)
+                # J⁻¹ C_total J⁻¹ᵀ  broadcast over n
+                C_gdc = np.einsum('ij,njk,lk->nil',
+                                  J_inv, C_total, J_inv)     # (n, 2, 2)
+            else:
+                J     = compute_poly_jacobian(               # (n, 2, 2)
+                    r_j, d["X_c"], d["Y_c"], self.poly_order)
+                J_inv = np.linalg.inv(J)                     # (n, 2, 2)
+                dxy   = np.einsum('nij,nj->ni', J_inv, resid_pseudo)  # (n, 2)
+                C_gdc = np.einsum('nij,njk,nlk->nil',
+                                  J_inv, C_total, J_inv)     # (n, 2, 2)
+
+            result[img] = {
+                "X_c":            d["X_c"],
+                "Y_c":            d["Y_c"],
+                "dx_gdc":         dxy[:, 0],
+                "dy_gdc":         dxy[:, 1],
+                "C_hst":          d["C_hst"],
+                "C_gdc_total":    C_gdc,
+                "sidx":           sidx,
+                "use_for_fit":    np.asarray(d["use_for_fit"],  dtype=bool),
+                "use_for_astrom": np.asarray(
+                    d.get("use_for_astrom", d["use_for_fit"]), dtype=bool),
+            }
+        return result
+
     def compute_star_influence(self, r_hat, C_r, a_arr):
         """
         Compute per-star, per-image leverage, influence, and Cook's distance.

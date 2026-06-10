@@ -84,7 +84,7 @@ def make_plots(solver, images, gaia_catalog,
 
     _gc = solver.gaia_cat
     _gaia_ids = _gc["Gaia_id"].to_numpy(dtype=np.int64, na_value=0)
-    hst_only  = (_gaia_ids < 0) & ~has_gaia
+    hst_only  = ~has_gaia
     _n_gc = len(_gc)
     if "pmra_xmatch" in _gc.columns:
         _pmra_xmatch  = np.array(

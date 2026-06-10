@@ -429,10 +429,35 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
     np.savez(output_dir / "use_for_astrom.npz", **_astrom_data)
     np.savez(output_dir / "star_indices.npz",   **_idx_data)
 
+    # 5. Per-detection GDC-frame residuals
+    # detections.npz: one group of arrays per image, keyed as {img}_{field}.
+    #   {img}_X_c, {img}_Y_c       — centered GDC pixel positions (X - Xo, Y - Yo)
+    #   {img}_dx_gdc, {img}_dy_gdc — residuals in GDC frame [pixels]  (J⁻¹ @ resid_pseudo)
+    #   {img}_C_hst                — (n,2,2) measurement covariance in GDC frame
+    #   {img}_sidx                 — star indices into stellar_astrometry.csv
+    #   {img}_use_for_fit          — bool, used for transformation fitting
+    #   {img}_use_for_astrom       — bool, used for stellar astrometry
+    gdc_resid = solver.compute_gdc_residuals(r_hat, v_hat, C_r=C_r, C_vT=C_vT)
+    _det_data = {}
+    n_det_total = 0
+    for img, rd in gdc_resid.items():
+        _det_data[f"{img}_X_c"]            = rd["X_c"]
+        _det_data[f"{img}_Y_c"]            = rd["Y_c"]
+        _det_data[f"{img}_dx_gdc"]         = rd["dx_gdc"]
+        _det_data[f"{img}_dy_gdc"]         = rd["dy_gdc"]
+        _det_data[f"{img}_C_hst"]          = rd["C_hst"]
+        _det_data[f"{img}_C_gdc_total"]    = rd["C_gdc_total"]
+        _det_data[f"{img}_sidx"]           = rd["sidx"]
+        _det_data[f"{img}_use_for_fit"]    = rd["use_for_fit"]
+        _det_data[f"{img}_use_for_astrom"] = rd["use_for_astrom"]
+        n_det_total += len(rd["sidx"])
+    np.savez_compressed(output_dir / "detections.npz", **_det_data)
+
     print(f"  Saved: stellar_astrometry.csv  "
           f"({len(g)} stars, {g['n_hst_used'].sum()} HST detections)")
+    print(f"  Saved: detections.npz  ({len(gdc_resid)} images, {n_det_total} detections)")
 
-    # 5. Machine-readable run configuration for downstream tools (e.g. hst_catalog_crossmatch)
+    # 6. Machine-readable run configuration for downstream tools (e.g. hst_catalog_crossmatch)
     import json as _json
     config = {
         'poly_order':   solver.poly_order,
