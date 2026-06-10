@@ -60,7 +60,7 @@ def main():
                         help='Posterior samples for marginalisation')
     parser.add_argument('--clip_sigma', type=float, default=4.5,
                         help='MAD sigma for outlier rejection (0 = disabled)')
-    parser.add_argument('--poly_order', type=int, default=1,
+    parser.add_argument('--poly_order', type=int, default=None,
                         help='Polynomial order for image transformation')
     parser.add_argument('--hst_enable_iter', type=int, default=5,
                         help='Outer iteration at which HST-only sources are enabled')
@@ -126,6 +126,18 @@ def main():
     bp3m_v1_dir = field_dir / 'BP3M_results'
     bp3m_v2_dir = field_dir / 'BP3M_v2_results'
     xmatch_dir  = field_dir / 'hst_xmatch'
+
+    # Default poly_order to whatever v1 used, if not explicitly specified
+    if args.poly_order is None:
+        _v1_cfg = bp3m_v1_dir / 'run_config.json'
+        if _v1_cfg.exists():
+            import json as _json
+            _v1_poly = _json.load(open(_v1_cfg)).get('poly_order', 1)
+            args.poly_order = _v1_poly
+            print(f"  poly_order not specified — using v1 value: {args.poly_order}")
+        else:
+            args.poly_order = 1
+            print(f"  poly_order not specified and no v1 run_config.json found — defaulting to 1")
 
     crossmatch_kwargs = dict(
         field_dir                = field_dir,
