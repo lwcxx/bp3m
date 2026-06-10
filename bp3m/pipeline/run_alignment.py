@@ -347,6 +347,7 @@ def _save_results(output_dir, solver, images, gaia_catalog, image_names,
             sigma_dra0_mas=np.sqrt(C_j[6,6])*1000,
             sigma_ddec0_mas=np.sqrt(C_j[7,7])*1000,
             alpha=alpha_applied,
+            **{f'r_{k}': float(r_j[k]) for k in range(8, solver.N_R)},
         ))
     pd.DataFrame(rows).to_csv(output_dir / "image_transformations.csv", index=False)
 
