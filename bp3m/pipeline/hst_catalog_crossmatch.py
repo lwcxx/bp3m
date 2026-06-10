@@ -2628,6 +2628,11 @@ def _measure_astrometry_proper(
             # Full 5×5 posterior covariance C_u (includes C_r propagation).
             # Stored flat as _Cu_{i}{j}; extracted to (N,5,5) npy at save time.
             **{f'_Cu_{i}{j}': np.nan for i in range(5) for j in range(5)},
+            # Conditional covariance C_vT (no C_r; stars independent given r).
+            # Stored flat as _CvT_{i}{j}; extracted to (N,5,5) npy at save time.
+            **{f'_CvT_{i}{j}': np.nan for i in range(5) for j in range(5)},
+            # K_pm = ∂(pm_i)/∂r, shape (2, n_r_total); popped before DataFrame build.
+            '_K_pm_ref': None,
         }
 
         if not valid_pairs:
@@ -2892,10 +2897,31 @@ def _measure_astrometry_proper(
             except np.linalg.LinAlgError:
                 return None
 
+            # ── Conditional covariance C_vT and PM sensitivity K_pm ──────────────
+            # C_vT = (H^T C_hst^{-1} H + C_prior^{-1})^{-1}: covariance given r fixed.
+            # K_pm = C_vT[2:4,:] @ (Σ_n H_n^T C_hst_n^{-1} X_n): shape (2, n_r_total).
+            # These allow proper marginalisation over C_r when computing the mean PM.
+            try:
+                C_hst_inv_n = np.linalg.inv(diag_blocks)                # (N, 2, 2)
+                H_n = H_stack.reshape(N, 2, 5)                           # (N, 2, 5)
+                CinvH_n = np.einsum('nij,njk->nik', C_hst_inv_n, H_n)   # (N, 2, 5)
+                AtCiA_cond = np.einsum('ndi,ndk->ik', H_n, CinvH_n) + C_prior_inv  # (5,5)
+                C_vT = np.linalg.inv(AtCiA_cond)                         # (5, 5) mas²
+                _n_r_tot = len(r_hat_arr)
+                HtCinvX = np.zeros((5, _n_r_tot))
+                for _a in range(N):
+                    _cs = int(cs_arr[_a])
+                    HtCinvX[:, _cs:_cs + n_r] += CinvH_n[_a].T @ X_arr[_a]
+                K_pm = C_vT[2:4, :] @ HtCinvX                            # (2, n_r_total)
+            except Exception:
+                C_vT = np.full((5, 5), np.nan)
+                K_pm = np.zeros((2, len(r_hat_arr)))
+
             return {
                 'u': u, 'C_u': C_u, 'N': N,
                 'Big_C': Big_C, 'Big_C_inv': Big_C_inv,
                 'H_stack': H_stack, 'deltas': deltas,
+                'C_vT': C_vT, 'K_pm': K_pm,
             }
 
         # Initial solve
@@ -3015,6 +3041,8 @@ def _measure_astrometry_proper(
             'epoch_ref_xmatch':        _GAIA_T_REF_YR,
             'chi2_xmatch':             chi2_dof,
             **{f'_Cu_{i}{j}': float(C_u[i, j]) for i in range(5) for j in range(5)},
+            **{f'_CvT_{i}{j}': float(fit['C_vT'][i, j]) for i in range(5) for j in range(5)},
+            '_K_pm_ref': fit['K_pm'],
         })
         return base_row
 
@@ -3080,7 +3108,15 @@ def _measure_astrometry_proper(
     print(f"  [phase4] total phase time: "
           f"{time.perf_counter() - _t0_phase:.1f}s")
 
-    return pd.DataFrame(out_rows, index=combined_df.index)
+    # Extract K_pm arrays before DataFrame construction — they can't be stored
+    # as regular DataFrame columns because they are (2, n_r_total) per star.
+    _n_r_tot = len(r_hat_arr)
+    K_pm_out = np.zeros((len(out_rows), 2, _n_r_tot), dtype=np.float32)
+    for _i, _row in enumerate(out_rows):
+        _kpm = _row.pop('_K_pm_ref', None)
+        if _kpm is not None:
+            K_pm_out[_i] = _kpm.astype(np.float32)
+    return pd.DataFrame(out_rows, index=combined_df.index), K_pm_out
 
 
 # ── Phase 5: PM-guided second-pass cross-match ────────────────────────────────
@@ -3722,6 +3758,7 @@ def run_hst_crossmatch(
     bp3m_dir = bp3m_results_dir
     astrom_df = pd.DataFrame()
     _p4: dict = {}   # stashed for Phase 5 re-use
+    _K_pm_store: dict = {}  # row_i (int) → K_pm_i (2, n_r_total) float32
     try:
         img_csv  = bp3m_dir / 'image_transformations.csv'
         c_r_path = bp3m_dir / 'C_r.npy'
@@ -3829,7 +3866,7 @@ def run_hst_crossmatch(
             print(f"  [phase4]   src_detections:   {time.perf_counter()-_t_pre:.2f}s  "
                   f"({len(_shared_src_detections)} entries)")
 
-            astrom_df = _measure_astrometry_proper(
+            astrom_df, K_pm_6 = _measure_astrometry_proper(
                 combined_df      = combined_df,
                 det_df           = det_df,
                 r_hat_arr        = r_hat4,
@@ -3854,6 +3891,10 @@ def run_hst_crossmatch(
 
             # Merge back onto combined_df
             combined_df = combined_df.join(astrom_df, how='left')
+
+            # Build K_pm store keyed by original row index
+            for _i, _ridx in enumerate(astrom_df.index):
+                _K_pm_store[int(_ridx)] = K_pm_6[_i]
 
             # Stash all Phase 4 ingredients so Phase 5 can re-use them
             _p4 = dict(
@@ -3909,7 +3950,7 @@ def run_hst_crossmatch(
                                                  'sigma_pmra_xmatch', 'sigma_pmdec_xmatch',
                                                  'sigma_parallax_xmatch')]
                         _cdf_4b = _cdf_4b.drop(columns=_drop_astrom, errors='ignore')
-                        _astrom_4b = _measure_astrometry_proper(
+                        _astrom_4b, K_pm_4b = _measure_astrometry_proper(
                             combined_df=_cdf_4b, det_df=det_df,
                             r_hat_arr=_p4['r_hat'], C_r=_p4['C_r'],
                             image_names=_p4['image_names'], n_r=_p4['n_r'],
@@ -3923,7 +3964,18 @@ def run_hst_crossmatch(
                         )
                         for _col in _astrom_4b.columns:
                             combined_dedup4b.loc[_cdf_4b.index, _col] = _astrom_4b[_col].values
+                        for _i, _ridx in enumerate(_astrom_4b.index):
+                            _K_pm_store[int(_ridx)] = K_pm_4b[_i]
+                    # Capture old index before reset_index reassigns 0..N-1
+                    _old_idx_4b = combined_dedup4b.index.tolist()
                     combined_df = combined_dedup4b.reset_index(drop=True)
+                    # Remap K_pm store from old indices to new 0..N-1
+                    if _K_pm_store:
+                        _K_pm_store = {
+                            _new_i: _K_pm_store[int(_old_i)]
+                            for _new_i, _old_i in enumerate(_old_idx_4b)
+                            if int(_old_i) in _K_pm_store
+                        }
                     print(f"  Phase 4b: merged {n_merged_4b} duplicate rows using ra_xmatch positions"
                           + (f"; re-fitted {n_refit_4b} sources" if n_refit_4b > 0 else ""))
 
@@ -3946,10 +3998,11 @@ def run_hst_crossmatch(
                     pass  # non-critical: chi2 columns simply absent
 
             # Re-save combined catalog with Phase 4 columns
-            # (drop the internal _Cu_{ij} columns before writing — they are
-            #  extracted to C_u_xmatch.npy by the Phase 7 save path)
-            _cu_cols_v1 = [c for c in combined_df.columns if c.startswith('_Cu_')]
-            _df_save = combined_df.drop(columns=_cu_cols_v1) if _cu_cols_v1 else combined_df
+            # (drop internal _Cu_/_CvT_ columns before writing — they are
+            #  extracted to *.npy arrays by the Phase 7 save path)
+            _internal_cols_v1 = [c for c in combined_df.columns
+                                  if c.startswith('_Cu_') or c.startswith('_CvT_')]
+            _df_save = combined_df.drop(columns=_internal_cols_v1) if _internal_cols_v1 else combined_df
             out_path = output_dir / 'master_combined.csv'
             if 'gaia_source_id' in _df_save.columns:
                 _df_save['gaia_source_id'] = _df_save['gaia_source_id'].fillna(0).astype(np.int64)
@@ -4005,7 +4058,7 @@ def run_hst_crossmatch(
                     # Name it so _parse_hst_indices_columns picks it up
                     _cdf_changed['hst_indices_pass2'] = _cdf_changed['pass2_hst_indices']
 
-                    _astrom_v2 = _measure_astrometry_proper(
+                    _astrom_v2, K_pm_v2 = _measure_astrometry_proper(
                         combined_df     = _cdf_changed,
                         det_df          = det_df,
                         r_hat_arr       = _p4['r_hat'],
@@ -4027,20 +4080,44 @@ def run_hst_crossmatch(
                     _changed_idx = combined_v2_df.index[_changed]
                     for _col in _astrom_v2.columns:
                         combined_v2_df.loc[_changed_idx, _col] = _astrom_v2[_col].values
+                    # Update K_pm store for refitted rows
+                    for _i, _ridx in enumerate(_astrom_v2.index):
+                        _K_pm_store[int(_ridx)] = K_pm_v2[_i]
                     _n_pm_v2 = int(np.isfinite(
                         combined_v2_df.loc[_changed_idx, 'pmra_xmatch']).sum())
                     print(f"  Phase 5: {_n_pm_v2}/{n_changed} re-fitted sources "
                           f"have full PM constraints")
 
-            # ── Save per-star C_u (5×5) covariance array ─────────────────────
-            # Rows align 1:1 with master_combined_v2.csv.  Includes full C_r
-            # propagation from Phase 6/7; NaN rows are failed / insufficient fits.
+            # ── Save per-star covariance arrays ───────────────────────────────
+            # All rows align 1:1 with master_combined_v2.csv.
+            # NaN rows indicate failed or insufficient fits.
+
+            # C_u (5×5): marginalised posterior — includes full C_r propagation.
             _cu_cols = [f'_Cu_{i}{j}' for i in range(5) for j in range(5)]
             if all(c in combined_v2_df.columns for c in _cu_cols):
                 _C_u_arr = combined_v2_df[_cu_cols].to_numpy(dtype=np.float64).reshape(-1, 5, 5)
                 np.save(output_dir / 'C_u_xmatch.npy', _C_u_arr)
                 print(f"  Saved → C_u_xmatch.npy  shape={_C_u_arr.shape}")
                 combined_v2_df = combined_v2_df.drop(columns=_cu_cols)
+
+            # C_vT (5×5): conditional posterior — stars independent given r_hat.
+            # Combined with K_pm, allows proper mean PM marginalisation over C_r.
+            _cvt_cols = [f'_CvT_{i}{j}' for i in range(5) for j in range(5)]
+            if all(c in combined_v2_df.columns for c in _cvt_cols):
+                _C_vT_arr = combined_v2_df[_cvt_cols].to_numpy(dtype=np.float64).reshape(-1, 5, 5)
+                np.save(output_dir / 'C_vT_xmatch.npy', _C_vT_arr)
+                print(f"  Saved → C_vT_xmatch.npy  shape={_C_vT_arr.shape}")
+                combined_v2_df = combined_v2_df.drop(columns=_cvt_cols)
+
+            # K_pm (N, 2, n_r_total): PM sensitivity ∂(pm_i)/∂r.
+            if _K_pm_store and _p4:
+                _n_r_tot_save = len(_p4['r_hat'])
+                _K_pm_arr = np.zeros((len(combined_v2_df), 2, _n_r_tot_save), dtype=np.float32)
+                for _i, _ridx in enumerate(combined_v2_df.index):
+                    if int(_ridx) in _K_pm_store:
+                        _K_pm_arr[_i] = _K_pm_store[int(_ridx)]
+                np.save(output_dir / 'K_pm_xmatch.npy', _K_pm_arr)
+                print(f"  Saved → K_pm_xmatch.npy  shape={_K_pm_arr.shape}")
 
             _out_v2 = output_dir / 'master_combined_v2.csv'
             if 'gaia_source_id' in combined_v2_df.columns:
