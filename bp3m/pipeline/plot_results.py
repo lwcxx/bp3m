@@ -120,15 +120,15 @@ def make_plots(solver, images, gaia_catalog,
 
     gm = gmag[has_gaia]
     ax_unc.scatter(gm, sig_pm_gaia[has_gaia],
-                   s=6, alpha=0.6, color='steelblue', label='Gaia', zorder=2)
+                   s=6, alpha=0.5, color='#aaaaaa', label='Gaia 5p', zorder=2)
     _bp3m_gaia_conv = bp3m_converged & has_gaia
     _bp3m_hst_conv  = bp3m_converged & hst_only
     ax_unc.scatter(gmag[_bp3m_gaia_conv], sig_pm_bp3m[_bp3m_gaia_conv],
-                   s=6, alpha=0.6, color='tomato',  label='BP3M (Gaia-matched)', zorder=3)
+                   s=6, alpha=0.7, color='steelblue', label='BP3M Gaia 5p', zorder=3)
     if _bp3m_hst_conv.any():
         ax_unc.scatter(gmag[_bp3m_hst_conv], sig_pm_bp3m[_bp3m_hst_conv],
-                       s=10, alpha=0.7, color='coral', marker='^',
-                       label='BP3M (HST-only)', zorder=4)
+                       s=10, alpha=0.8, color='darkorange', marker='^',
+                       label='BP3M Gaia 2p + HST', zorder=4)
     ax_unc.set_xlabel("G [mag]")
     ax_unc.set_ylabel(r"$(\det\,C_{\mu})^{1/4}$ [mas/yr]")
     ax_unc.set_title(r"Geometric-mean PM uncertainty $(\det\,C_{\mu})^{1/4}$ vs magnitude")
