@@ -332,6 +332,7 @@ def prepare_jax_inputs(
     y_offset: float = 0.0,
     psf_coeffs_cube: np.ndarray | None = None,
     restore_fluxes: np.ndarray | None = None,
+    n_jobs: int = 1,
 ) -> dict:
     """Batch all stars into fixed-shape NumPy arrays for the JAX kernel.
 
@@ -408,7 +409,7 @@ def prepare_jax_inputs(
     xi_out              = np.empty(n_stars,             dtype=np.int32)
     yi_out              = np.empty(n_stars,             dtype=np.int32)
 
-    for i in range(n_stars):
+    def _process_star(i):
         x0  = float(xs_stars[i])
         y0  = float(ys_stars[i])
         sky = float(sky_estimates[i])
@@ -453,13 +454,21 @@ def prepare_jax_inputs(
         # Restore this star's flux into its pixel window (refit mode only).
         # residual image has all stars subtracted; adding back flux_k lets
         # the solver see an isolated star instead of a star-shaped hole.
-        if restore_fluxes is not None and restore_fluxes[i] != 0.0:
+        rf = restore_fluxes[i] if restore_fluxes is not None else 0.0
+        if rf != 0.0:
             P_restore, _, _ = eval_psf_on_tile(coeff_tile, dx0, dy0, hw, psf_scale)
             pv = pv.copy()
-            pv[valid] += restore_fluxes[i] * P_restore[valid]
+            pv[valid] += rf * P_restore[valid]
 
         flux, sky_fit = flux_sky_init(coeff_tile, pv, valid, dx0, dy0, hw, psf_scale, sky)
 
+        return tile, coeff_tile, pv, pvar, valid, dx0, dy0, flux, sky_fit, xi, yi
+
+    # Threading does not help here: Python-level GIL overhead in interpolate_psf
+    # serializes all threads regardless of n_jobs. Run serially.
+    results = [_process_star(i) for i in range(n_stars)]
+
+    for i, (tile, coeff_tile, pv, pvar, valid, dx0, dy0, flux, sky_fit, xi, yi) in enumerate(results):
         psf_tiles_out[i]       = tile
         psf_coeff_tiles_out[i] = coeff_tile
         pixel_vals_out[i]      = pv
@@ -772,13 +781,17 @@ def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool):
         return P, dPdx, dPdy
 
     def _atwa_and_atwr(A0, A1, A2, A3, w, r):
-        """Build 4×4 weighted normal-equation matrix and 4-vector RHS."""
-        cols = (A0, A1, A2, A3)
-        AtWA = jnp.array([
-            [jnp.dot(cols[i], cols[j] * w) for j in range(4)]
-            for i in range(4)
-        ])
-        AtWr = jnp.array([jnp.dot(cols[i], w * r) for i in range(4)])
+        """Build 4×4 weighted normal-equation matrix and 4-vector RHS.
+
+        A = stack([A0,A1,A2,A3])  shape (4, n_pix)
+        AtWA = A @ diag(w) @ A.T = (A*w) @ A.T   — one (4,4) matmul
+        AtWr = A @ diag(w) @ r   = (A*w) @ r     — one (4,) matvec
+        Replaces 20 scalar dot products with 2 BLAS calls.
+        """
+        A = jnp.stack([A0, A1, A2, A3], axis=0)  # (4, n_pix)
+        Aw = A * w                                 # (4, n_pix)
+        AtWA = Aw @ A.T                            # (4, 4)
+        AtWr = Aw @ r                              # (4,)
         return AtWA, AtWr
 
     def _fit_one(coeff_tile, pixel_vals, pixel_var_rn, valid_f,
@@ -877,10 +890,15 @@ def _build_jax_kernel(hw: int, psf_scale: int, has_noise_map: bool):
         return (flux, dx, dy, sky, cov, n_iter, converged, _dm,
                 qfit, chi2, psf_frac, central_res)
 
-    _batched = jax.jit(jax.vmap(
-        _fit_one,
-        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, None, None),
-    ))
+    n_devices = len(jax.devices())
+    _vmapped = jax.vmap(_fit_one, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, None, None))
+    if n_devices > 1:
+        # pmap distributes shards across virtual CPU devices (each device gets its
+        # own OS thread and a portion of the XLA thread pool), then vmap maps over
+        # stars within each shard. Inputs must be pre-shaped (n_devices, n_per_device, ...).
+        _batched = jax.pmap(_vmapped, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, None, None, None))
+    else:
+        _batched = jax.jit(_vmapped)
     return _batched
 
 
@@ -917,44 +935,79 @@ def fit_batch_jax(
         psf_frac           : (n_stars,) float64 — PSF value at center pixel
         central_res        : (n_stars,) float64 — normalised central residual
     """
+    import jax
     import jax.numpy as jnp
 
-    hw         = inputs_dict['hw']
-    psf_scale  = inputs_dict['psf_scale']
-    has_nm     = inputs_dict.get('has_noise_map', False)
+    hw        = inputs_dict['hw']
+    psf_scale = inputs_dict['psf_scale']
+    has_nm    = inputs_dict.get('has_noise_map', False)
+    n_stars   = len(inputs_dict['dx0'])
+    n_devices = len(jax.devices())
 
-    cache_key = (hw, psf_scale, has_nm)
+    cache_key = (hw, psf_scale, has_nm, n_devices)
     if cache_key not in _JAX_KERNEL_CACHE:
         _JAX_KERNEL_CACHE[cache_key] = _build_jax_kernel(hw, psf_scale, has_nm)
     _fn = _JAX_KERNEL_CACHE[cache_key]
 
-    tiles  = jnp.array(inputs_dict['psf_coeff_tiles'], dtype=jnp.float64)
-    pvals  = jnp.array(inputs_dict['pixel_vals'],      dtype=jnp.float64)
-    pvar   = jnp.array(inputs_dict['pixel_var_rn'],    dtype=jnp.float64)
-    vmask  = jnp.array(inputs_dict['valid_masks'],     dtype=jnp.float64)
-    dx0    = jnp.array(inputs_dict['dx0'],           dtype=jnp.float64)
-    dy0    = jnp.array(inputs_dict['dy0'],           dtype=jnp.float64)
-    flux0  = jnp.array(inputs_dict['flux0'],         dtype=jnp.float64)
-    sky0   = jnp.array(inputs_dict['sky0'],          dtype=jnp.float64)
+    if n_devices > 1:
+        # Pad n_stars to the next multiple of n_devices, then reshape to
+        # (n_devices, n_per_device, ...) for pmap.
+        pad = (-n_stars) % n_devices
+        n_padded = n_stars + pad
+        n_per = n_padded // n_devices
+
+        def _prep(arr, dtype, fill=0.0):
+            a = jnp.array(arr, dtype=dtype)
+            if pad:
+                a = jnp.concatenate(
+                    [a, jnp.full((pad,) + a.shape[1:], fill, dtype=dtype)]
+                )
+            return a.reshape((n_devices, n_per) + a.shape[1:])
+
+        tiles = _prep(inputs_dict['psf_coeff_tiles'], jnp.float64)
+        pvals = _prep(inputs_dict['pixel_vals'],      jnp.float64)
+        pvar  = _prep(inputs_dict['pixel_var_rn'],    jnp.float64)
+        vmask = _prep(inputs_dict['valid_masks'],     jnp.float64)
+        dx0   = _prep(inputs_dict['dx0'],             jnp.float64)
+        dy0   = _prep(inputs_dict['dy0'],             jnp.float64)
+        flux0 = _prep(inputs_dict['flux0'],           jnp.float64)
+        sky0  = _prep(inputs_dict['sky0'],            jnp.float64)
+
+        result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
+                     float(gain), float(tol), int(max_iter))
+
+        def _trim(a):
+            return np.asarray(a.reshape((-1,) + a.shape[2:])[:n_stars])
+    else:
+        tiles  = jnp.array(inputs_dict['psf_coeff_tiles'], dtype=jnp.float64)
+        pvals  = jnp.array(inputs_dict['pixel_vals'],      dtype=jnp.float64)
+        pvar   = jnp.array(inputs_dict['pixel_var_rn'],    dtype=jnp.float64)
+        vmask  = jnp.array(inputs_dict['valid_masks'],     dtype=jnp.float64)
+        dx0    = jnp.array(inputs_dict['dx0'],             dtype=jnp.float64)
+        dy0    = jnp.array(inputs_dict['dy0'],             dtype=jnp.float64)
+        flux0  = jnp.array(inputs_dict['flux0'],           dtype=jnp.float64)
+        sky0   = jnp.array(inputs_dict['sky0'],            dtype=jnp.float64)
+
+        result = _fn(tiles, pvals, pvar, vmask, dx0, dy0, flux0, sky0,
+                     float(gain), float(tol), int(max_iter))
+
+        def _trim(a):
+            return np.asarray(a)
 
     (flux, dx, dy, sky, cov, n_iter, converged, delta_max,
-     qfit, chi2, psf_frac, central_res) = _fn(
-        tiles, pvals, pvar, vmask,
-        dx0, dy0, flux0, sky0,
-        float(gain), float(tol), int(max_iter),
-    )
+     qfit, chi2, psf_frac, central_res) = result
 
     return dict(
-        flux        = np.asarray(flux),
-        dx          = np.asarray(dx),
-        dy          = np.asarray(dy),
-        sky         = np.asarray(sky),
-        cov         = np.asarray(cov),
-        n_iter      = np.asarray(n_iter),
-        converged   = np.asarray(converged),
-        delta_max   = np.asarray(delta_max),
-        qfit        = np.asarray(qfit),
-        chi2        = np.asarray(chi2),
-        psf_frac    = np.asarray(psf_frac),
-        central_res = np.asarray(central_res),
+        flux        = _trim(flux),
+        dx          = _trim(dx),
+        dy          = _trim(dy),
+        sky         = _trim(sky),
+        cov         = _trim(cov),
+        n_iter      = _trim(n_iter),
+        converged   = _trim(converged),
+        delta_max   = _trim(delta_max),
+        qfit        = _trim(qfit),
+        chi2        = _trim(chi2),
+        psf_frac    = _trim(psf_frac),
+        central_res = _trim(central_res),
     )

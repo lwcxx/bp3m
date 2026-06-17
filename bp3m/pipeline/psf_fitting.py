@@ -44,6 +44,7 @@ def _ensure_py1pass():
 # ── Default PSF-fitting parameters (user-confirmed for HST FLC images) ──────
 _HST_DEFAULTS = dict(
     fmin_thresh=100.0,
+    mag_st_max=28.0,
     hmin=4,
     n_passes=2,
     n_discovery_passes=1,
@@ -821,6 +822,162 @@ def remeasure_psf_perturbation(
     return done
 
 
+def _get_image_header_info(img_path):
+    """Read minimal FITS header info for the one-liner status print. Fast — primary header only."""
+    try:
+        from astropy.io import fits as _f
+        with _f.open(str(img_path), memmap=False) as h:
+            hdr = h[0].header
+        instrume = hdr.get('INSTRUME', '?').strip()
+        detector = hdr.get('DETECTOR', '').strip()
+        instdet  = f"{instrume}/{detector}" if detector else instrume
+        filt = hdr.get('FILTER2', hdr.get('FILTER1', hdr.get('FILTER', '?'))).strip()
+        exptime  = float(hdr.get('EXPTIME', 0))
+        return {'instdet': instdet, 'filter': filt, 'exptime': exptime}
+    except Exception:
+        return {'instdet': '?', 'filter': '?', 'exptime': 0}
+
+
+# Global status queue set by pool initializer in parallel mode.
+_status_queue = None
+
+def _worker_pool_init(queue):
+    global _status_queue
+    _status_queue = queue
+
+
+def _image_worker(args):
+    """Parallel worker: fit all PSF iterations for one image, log to file.
+
+    Sets OMP_NUM_THREADS=1 and jax_num_cpu_devices=1 so workers don't
+    fight over cores.  All verbose output goes to psf_fitting_log.txt in the
+    image's subfolder.  Status messages (start/finish/fail) are sent to the
+    shared queue for the main process to print as one-liners.
+
+    args: (img_path, catalog_path, lib_dir, params, params_meta_disk,
+           n_img_iter, clean_psf, apply_psf_delta, force_refit)
+    Returns: (success, str(img_path), n_found, n_converged, n_stars, elapsed, error_msg)
+    """
+    import os, sys, time, traceback
+    global _status_queue
+
+    (img_path, catalog_path, lib_dir, params, params_meta_disk,
+     n_img_iter, clean_psf, apply_psf_delta, force_refit) = args
+
+    img_path    = Path(img_path)
+    catalog_path = Path(catalog_path)
+    log_path    = img_path.parent / 'psf_fitting_log.txt'
+    img_name    = img_path.name
+
+    # Limit resource usage: one worker = one core.
+    for _var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+        os.environ[_var] = '1'
+    try:
+        import jax as _jax
+        _jax.config.update('jax_num_cpu_devices', 1)
+    except Exception:
+        pass
+
+    t0 = time.perf_counter()
+
+    if _status_queue is not None:
+        _status_queue.put(('start', img_name))
+
+    try:
+        with open(log_path, 'w', buffering=1) as _log:
+            _old_stdout = sys.stdout
+            sys.stdout  = _log
+            try:
+                # Replicate the per-image PSF iteration loop from run_psf_fitting.
+                use_clean = clean_psf or (not apply_psf_delta) or force_refit
+                if use_clean:
+                    initial_delta = None
+                else:
+                    delta_path = img_path.parent / 'psf_delta.npy'
+                    try:
+                        initial_delta = np.load(str(delta_path)) if delta_path.exists() else None
+                    except Exception:
+                        initial_delta = None
+
+                current_delta = initial_delta
+                succeeded = False
+
+                for iter_i in range(n_img_iter):
+                    label = f"iter {iter_i + 1}/{n_img_iter}"
+                    if current_delta is not None:
+                        print(f"   [{label}] PSF: CORRECTED (peak = {float(np.abs(current_delta).max()):+.5f})")
+                    else:
+                        print(f"   [{label}] PSF: BARE stdpsf")
+
+                    w = (img_path, catalog_path, lib_dir, params,
+                         params_meta_disk, True, current_delta)
+                    path, n_stars, err = _fit_one_image(w)
+                    if err:
+                        print(f"   ERROR [{label}] {img_name}: {err}")
+                        break
+                    print(f"   [{label}] {img_name}: {n_stars} stars fitted")
+                    succeeded = True
+
+                    # Preserve intermediate PSF figures before next iteration.
+                    if iter_i < n_img_iter - 1:
+                        import shutil as _sh
+                        for _fig in ("psf_catalog_stats.png", "psf_concentration.png",
+                                     "psf_diagnostics.png", "psf_residual_map.png",
+                                     "psf_perturbation.png"):
+                            _src = img_path.parent / _fig
+                            if _src.exists():
+                                _sh.copy2(str(_src),
+                                          str(img_path.parent / (_src.stem + f"_iter{iter_i+1}" + _src.suffix)))
+
+                    # Load updated delta for next iteration.
+                    if iter_i < n_img_iter - 1:
+                        delta_path = img_path.parent / 'psf_delta.npy'
+                        if delta_path.exists():
+                            try:
+                                current_delta = np.load(str(delta_path))
+                            except Exception as _e:
+                                print(f"   WARNING: could not load δP for next iter: {_e}")
+                                break
+                        else:
+                            print(f"   WARNING: no psf_delta.npy after {label} — stopping")
+                            break
+
+            except Exception:
+                print(traceback.format_exc())
+                succeeded = False
+            finally:
+                sys.stdout = _old_stdout
+
+        # Extract summary stats from the written catalog.
+        n_found = n_converged = n_stars_cls = 0
+        if succeeded and catalog_path.exists():
+            try:
+                from astropy.table import Table as _T
+                _cat = _T.read(str(catalog_path))
+                n_found = len(_cat)
+                n_converged  = int(np.sum(_cat['converged'])) if 'converged' in _cat.colnames else n_found
+                n_stars_cls  = int(np.sum(_cat['is_star']))   if 'is_star'   in _cat.colnames else n_found
+            except Exception:
+                n_found = n_converged = n_stars_cls = 0
+
+        elapsed = time.perf_counter() - t0
+        if _status_queue is not None:
+            _status_queue.put(('done', img_name, n_found, n_converged, n_stars_cls, elapsed))
+        return (succeeded, str(img_path), n_found, n_converged, n_stars_cls, elapsed, None)
+
+    except Exception as e:
+        elapsed = time.perf_counter() - t0
+        tb = traceback.format_exc()
+        try:
+            with open(log_path, 'a') as _log:
+                _log.write(f"\nFATAL ERROR: {e}\n{tb}")
+        except Exception:
+            pass
+        if _status_queue is not None:
+            _status_queue.put(('fail', img_name, str(e), elapsed))
+        return (False, str(img_path), 0, 0, 0, elapsed, str(e))
+
+
 def _fit_one_image(args):
     """Fit a single FLC image. Returns (path, n_stars, error).
 
@@ -946,8 +1103,9 @@ def _fit_one_image(args):
                     if _cm is None:
                         continue
                     try:
-                        _xi = int(round(float(_r.x)))
-                        _yi = int(round(float(_r.y)))
+                        # Records have full-frame coords; convert to chip-local.
+                        _xi = int(round(float(_r.x - _x_off)))
+                        _yi = int(round(float(_r.y - _y_off)))
                         _y0 = max(0, _yi - _hw)
                         _y1 = min(_ny, _yi + _hw + 1)
                         _x0 = max(0, _xi - _hw)
@@ -1112,8 +1270,11 @@ def _fit_one_image(args):
                     str(image_path), sci_ext=_sci_ext, dq_ext=_dq_ext)
                 _chip_recs = [r for r in _disk_records
                               if getattr(r, '_chip_ext', _sci_ext) == _sci_ext]
-                # Offsets not stored in catalog; set from chip config.
+                # Catalog stores full-frame coordinates; convert to chip-local
+                # so residual stamps land correctly inside the chip image.
                 for r in _chip_recs:
+                    r.x = r.x - _x_off
+                    r.y = r.y - _y_off
                     r._x_offset = _x_off
                     r._y_offset = _y_off
                 _residual = _data.copy()
@@ -1206,6 +1367,7 @@ def run_psf_fitting(
     n_psf_iter: int | None = None,
     restrict_to_obsids: list[str] | None = None,
     psf_dir: Path | None = None,
+    parallel: bool = True,
     # py1pass parameter overrides
     fmin: float | None = None,
     fmin_thresh: float | None = None,
@@ -1320,10 +1482,13 @@ def run_psf_fitting(
     params['n_jobs'] = n_processes
 
     # psf_fit_params_meta is the cache key for the PSF *fitting* step.
-    # conc_limit is intentionally excluded: changing it should only trigger
-    # reclassification, not a full re-fit. It is stored separately in
-    # psf_params.json under 'conc_limit' so reclassify_psf_catalogs can check it.
-    _fit_cache_keys = {k: v for k, v in params.items() if k != 'conc_limit'}
+    # Parameters that do NOT affect photometric results are excluded so that
+    # changing them doesn't force a pointless re-fit:
+    #   conc_limit  — triggers reclassification only, not re-fitting
+    #   n_jobs      — parallelism only; same results regardless of core count
+    #   backend     — JAX vs numpy produce identical results by design
+    _FIT_CACHE_EXCLUDE = {'conc_limit', 'n_jobs', 'backend'}
+    _fit_cache_keys = {k: v for k, v in params.items() if k not in _FIT_CACHE_EXCLUDE}
     params_meta = {'lib_dir': str(lib_dir), **_fit_cache_keys}
     # Full params_meta written to disk also records conc_limit for reference,
     # but the cache comparison uses only _fit_cache_keys.
@@ -1381,8 +1546,7 @@ def run_psf_fitting(
         _mag_str    = f"--fmin {fmin}  (overrides mag_st_max and fmin_thresh)"
         _thresh_str = ""
     else:
-        _mag_str    = f"--mag_st_max {params['mag_st_max']}" if 'mag_st_max' in params \
-                      else "--mag_st_max 28.0  (default)"
+        _mag_str    = f"--mag_st_max {params['mag_st_max']}"
         _thresh_str = f"--fmin_thresh {params['fmin_thresh']}"
     _cmd = (
         f"pypass --image <img> --lib_dir {lib_dir}"
@@ -1408,104 +1572,206 @@ def run_psf_fitting(
 
     catalogs = []
     n_work = len(work)
+    n_img_iter = n_psf_iter if n_psf_iter is not None else 1
 
-    for img_i, img in enumerate(work, 1):
-        catalog = img.parent / f"{img.stem}_catalog.fits"
+    # ── Parallel mode: N images simultaneously, each on 1 core ───────────────
+    if parallel and n_work > 0:
+        import multiprocessing as _mp
+        import datetime as _dt
 
-        # Determine starting delta and iteration count for this image.
-        # Default: 1 iteration with bare stdpsf.  Applying the measured δP back
-        # into the PSF model for a second pass can introduce bilinear-interpolation
-        # aliasing that degrades the 2-D pixel-phase distribution for sparse fields.
-        #
-        # Rules for initial_delta (which PSF to fit with):
-        #   Default              → bare stdpsf (use_clean=True)
-        #   apply_psf_delta=True → load stored delta if psf_delta.npy exists
-        #   clean_psf=True       → always bare stdpsf, overrides apply_psf_delta
-        #   force_refit=True     → bare stdpsf (re-fitting from scratch)
-        use_clean = clean_psf or (not apply_psf_delta) or force_refit
-        if use_clean:
-            initial_delta = None
-        else:
-            delta_path = img.parent / "psf_delta.npy"
-            if delta_path.exists():
+        def _ts():
+            return _dt.datetime.now().strftime('%H:%M:%S')
+
+        n_workers = n_processes if n_processes > 0 else _mp.cpu_count()
+        print(f"  Parallel PSF fitting: {n_work} image(s), "
+              f"{min(n_workers, n_work)} simultaneous workers. "
+              f"Verbose output → psf_fitting_log.txt per image.\n")
+
+        _mgr = _mp.Manager()
+        _queue = _mgr.Queue()
+
+        worker_args = []
+        for img in work:
+            catalog = img.parent / f"{img.stem}_catalog.fits"
+            worker_args.append((
+                img, catalog, lib_dir, params, params_meta_disk,
+                n_img_iter, clean_psf, apply_psf_delta, force_refit,
+            ))
+
+        # Print header info for all images before the pool starts.
+        _hdr_info = {img: _get_image_header_info(img) for img in work}
+
+        _pool = _mp.Pool(
+            processes=min(n_workers, n_work),
+            initializer=_worker_pool_init,
+            initargs=(_queue,),
+        )
+        _async_results = {
+            _pool.apply_async(_image_worker, (wargs,)): img
+            for wargs, img in zip(worker_args, work)
+        }
+        _pool.close()
+
+        _pending = set(_async_results)
+        _done    = 0
+
+        while _pending:
+            # Drain status messages from workers.
+            while True:
                 try:
-                    initial_delta = np.load(str(delta_path))
+                    msg = _queue.get_nowait()
+                    kind = msg[0]
+                    img_nm = msg[1]
+                    if kind == 'start':
+                        # Find the matching image path for header info.
+                        _img_match = next(
+                            (i for i in work if i.name == img_nm), None)
+                        info = _hdr_info.get(_img_match, {})
+                        _id  = info.get('instdet', '?')
+                        _fi  = info.get('filter',  '?')
+                        _et  = info.get('exptime',  0)
+                        _ft  = params.get('fmin_thresh', '')
+                        print(f"[{_ts()}] Starting  {img_nm} "
+                              f"({_id} {_fi}, {_et:.0f}s, fmin_thresh={_ft}e-)")
+                    elif kind == 'done':
+                        _, img_nm, nf, nc, ns, elapsed = msg
+                        _done += 1
+                        print(f"[{_ts()}] Finished  {img_nm} in {elapsed:.0f}s — "
+                              f"{nf} found, {nc} converged, {ns} stars "
+                              f"[{_done}/{n_work}]")
+                    elif kind == 'fail':
+                        _, img_nm, errmsg, elapsed = msg
+                        _done += 1
+                        print(f"[{_ts()}] FAILED    {img_nm} after {elapsed:.0f}s — "
+                              f"{errmsg} [{_done}/{n_work}]")
+                except Exception:
+                    break  # queue empty
+
+            # Check for completed async results.
+            finished = [ar for ar in _pending if ar.ready()]
+            for ar in finished:
+                _pending.discard(ar)
+                img = _async_results[ar]
+                catalog = img.parent / f"{img.stem}_catalog.fits"
+                try:
+                    success, _, nf, nc, ns, elapsed, err = ar.get()
+                    if success:
+                        catalogs.append(catalog)
+                    elif err:
+                        # Error already printed via queue; just log here.
+                        pass
+                except Exception as _e:
+                    print(f"[{_ts()}] FAILED    {img.name} — {_e}")
+
+            if _pending:
+                import time as _time
+                _time.sleep(0.2)
+
+        # Drain any remaining queue messages after all workers finish.
+        while True:
+            try:
+                msg = _queue.get_nowait()
+                kind = msg[0]
+                img_nm = msg[1]
+                if kind == 'done':
+                    _, img_nm, nf, nc, ns, elapsed = msg
+                    _done += 1
+                    print(f"[{_ts()}] Finished  {img_nm} in {elapsed:.0f}s — "
+                          f"{nf} found, {nc} converged, {ns} stars "
+                          f"[{_done}/{n_work}]")
+                elif kind == 'fail':
+                    _, img_nm, errmsg, elapsed = msg
+                    _done += 1
+                    print(f"[{_ts()}] FAILED    {img_nm} after {elapsed:.0f}s — "
+                          f"{errmsg} [{_done}/{n_work}]")
+            except Exception:
+                break
+
+        _pool.join()
+        _mgr.shutdown()
+        print()
+
+    # ── Serial mode: one image at a time (current behaviour) ─────────────────
+    else:
+        for img_i, img in enumerate(work, 1):
+            catalog = img.parent / f"{img.stem}_catalog.fits"
+
+            use_clean = clean_psf or (not apply_psf_delta) or force_refit
+            if use_clean:
+                initial_delta = None
+            else:
+                delta_path = img.parent / "psf_delta.npy"
+                try:
+                    initial_delta = np.load(str(delta_path)) if delta_path.exists() else None
                 except Exception:
                     initial_delta = None
+
+            try:
+                from astropy.io import fits as _fits_hdr
+                _et = float(_fits_hdr.getval(str(img), 'EXPTIME', ext=0))
+                _et_str = f"  EXPTIME={_et:.1f}s"
+            except Exception:
+                _et_str = ""
+            print(f"\n── [{img_i}/{n_work}] {field_name}  {img.name}{_et_str} ──────────────────────────────────")
+            if initial_delta is not None:
+                peak = float(np.abs(initial_delta).max())
+                print(f"   PSF model  : CORRECTED  (stored δP, cumulative peak = {peak:+.5f})")
+            elif clean_psf:
+                print(f"   PSF model  : BARE stdpsf  (--clean_psf)")
+            elif force_refit:
+                print(f"   PSF model  : BARE stdpsf  (--force_refit_psf)")
+            elif apply_psf_delta:
+                print(f"   PSF model  : BARE stdpsf  (--apply_psf_delta specified but no psf_delta.npy found)")
             else:
-                initial_delta = None
+                print(f"   PSF model  : BARE stdpsf  (default)")
+            print(f"   Iterations : {n_img_iter}")
 
-        n_img_iter = n_psf_iter if n_psf_iter is not None else 1
+            current_delta = initial_delta
+            img_succeeded = False
 
-        try:
-            from astropy.io import fits as _fits_hdr
-            _et = float(_fits_hdr.getval(str(img), 'EXPTIME', ext=0))
-            _et_str = f"  EXPTIME={_et:.1f}s"
-        except Exception:
-            _et_str = ""
-        print(f"\n── [{img_i}/{n_work}] {field_name}  {img.name}{_et_str} ──────────────────────────────────")
-        if initial_delta is not None:
-            peak = float(np.abs(initial_delta).max())
-            print(f"   PSF model  : CORRECTED  (stored δP, cumulative peak = {peak:+.5f})")
-        elif clean_psf:
-            print(f"   PSF model  : BARE stdpsf  (--clean_psf)")
-        elif force_refit:
-            print(f"   PSF model  : BARE stdpsf  (--force_refit_psf)")
-        elif apply_psf_delta:
-            print(f"   PSF model  : BARE stdpsf  (--apply_psf_delta specified but no psf_delta.npy found)")
-        else:
-            print(f"   PSF model  : BARE stdpsf  (default)")
-        print(f"   Iterations : {n_img_iter}")
-
-        current_delta = initial_delta
-        img_succeeded = False
-
-        for iter_i in range(n_img_iter):
-            label = f"iter {iter_i + 1}/{n_img_iter}"
-            if current_delta is not None:
-                peak = float(np.abs(current_delta).max())
-                print(f"   [{label}] PSF: CORRECTED (peak = {peak:+.5f})")
-            else:
-                print(f"   [{label}] PSF: BARE stdpsf")
-            w = (img, catalog, lib_dir, params, params_meta_disk, verbose, current_delta)
-            path, n_stars, err = _fit_one_image(w)
-            name = Path(path).name
-            if err:
-                print(f"   ERROR [{label}] {name}: {err}")
-                break
-            print(f"   [{label}] {name}: {n_stars} stars fitted")
-            img_succeeded = True
-
-            # Preserve diagnostic figures from this iteration before they are
-            # overwritten by the next one.  Copies go to e.g. psf_diagnostics_iter1.png.
-            if iter_i < n_img_iter - 1:
-                import shutil as _shutil
-                _suffix = f"_iter{iter_i + 1}"
-                for _fig in ("psf_catalog_stats.png", "psf_concentration.png",
-                             "psf_diagnostics.png", "psf_residual_map.png",
-                             "psf_perturbation.png"):
-                    _src = img.parent / _fig
-                    if _src.exists():
-                        _dst = img.parent / (_src.stem + _suffix + _src.suffix)
-                        _shutil.copy2(str(_src), str(_dst))
-
-            # Load the freshly-saved cumulative delta for the next iteration.
-            if iter_i < n_img_iter - 1:
-                delta_path = img.parent / "psf_delta.npy"
-                if delta_path.exists():
-                    try:
-                        current_delta = np.load(str(delta_path))
-                        peak = float(np.abs(current_delta).max())
-                        print(f"   Loaded updated δP for next iter (cumulative peak = {peak:+.5f})")
-                    except Exception as _e:
-                        print(f"   WARNING: {name}: could not load δP for next iter: {_e}")
-                        break
+            for iter_i in range(n_img_iter):
+                label = f"iter {iter_i + 1}/{n_img_iter}"
+                if current_delta is not None:
+                    peak = float(np.abs(current_delta).max())
+                    print(f"   [{label}] PSF: CORRECTED (peak = {peak:+.5f})")
                 else:
-                    print(f"   WARNING: {name}: no psf_delta.npy after {label} — stopping")
+                    print(f"   [{label}] PSF: BARE stdpsf")
+                w = (img, catalog, lib_dir, params, params_meta_disk, verbose, current_delta)
+                path, n_stars, err = _fit_one_image(w)
+                name = Path(path).name
+                if err:
+                    print(f"   ERROR [{label}] {name}: {err}")
                     break
+                print(f"   [{label}] {name}: {n_stars} stars fitted")
+                img_succeeded = True
 
-        if img_succeeded:
-            catalogs.append(catalog)
+                if iter_i < n_img_iter - 1:
+                    import shutil as _shutil
+                    _suffix = f"_iter{iter_i + 1}"
+                    for _fig in ("psf_catalog_stats.png", "psf_concentration.png",
+                                 "psf_diagnostics.png", "psf_residual_map.png",
+                                 "psf_perturbation.png"):
+                        _src = img.parent / _fig
+                        if _src.exists():
+                            _dst = img.parent / (_src.stem + _suffix + _src.suffix)
+                            _shutil.copy2(str(_src), str(_dst))
+
+                if iter_i < n_img_iter - 1:
+                    delta_path = img.parent / "psf_delta.npy"
+                    if delta_path.exists():
+                        try:
+                            current_delta = np.load(str(delta_path))
+                            peak = float(np.abs(current_delta).max())
+                            print(f"   Loaded updated δP for next iter (cumulative peak = {peak:+.5f})")
+                        except Exception as _e:
+                            print(f"   WARNING: {name}: could not load δP for next iter: {_e}")
+                            break
+                    else:
+                        print(f"   WARNING: {name}: no psf_delta.npy after {label} — stopping")
+                        break
+
+            if img_succeeded:
+                catalogs.append(catalog)
 
     # Include previously-skipped catalogs in the return list.
     for img in images:

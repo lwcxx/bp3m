@@ -326,6 +326,11 @@ def _parse_args():
                      help='Non-interactive mode; use defaults without prompts')
     ctl.add_argument('--checkpoint_dir', type=str, default=None,
                      help='Save BP3M checkpoint to this directory for later re-use')
+    ctl.add_argument('--single-image', dest='single_image', action='store_true',
+                     help='Process images one at a time (serial), giving each image '
+                          '--n_processes cores via JAX pmap.  Default is to process '
+                          'multiple images simultaneously with one core each, which '
+                          'gives much higher throughput when fitting >10 images.')
 
     return p.parse_args()
 
@@ -406,9 +411,11 @@ def _resolve_target(args):
 def main():
     args = _parse_args()
 
-    # Wire --n_processes to BLAS and JAX thread limits so all parallelism
-    # is bounded by the same value. Env vars cover JAX (imported lazily)
-    # and subprocesses; threadpoolctl covers already-loaded BLAS pools.
+    # Wire --n_processes to thread limits.
+    # In parallel image mode (default): workers set their own limits; the main
+    # process only needs env vars for any numpy work it does before spawning.
+    # In single-image mode: also configure JAX pmap devices so the single image
+    # can use n_processes virtual CPU devices for fit_batch_jax.
     if args.n_processes != -1:
         _n = str(args.n_processes)
         os.environ['OMP_NUM_THREADS']      = _n
@@ -419,6 +426,14 @@ def main():
             _tpc.threadpool_limits(limits=args.n_processes)
         except ImportError:
             pass
+        if args.single_image:
+            # Only initialize JAX in the main process for single-image mode.
+            # In parallel mode workers import JAX themselves with jax_num_cpu_devices=1.
+            try:
+                import jax as _jax
+                _jax.config.update('jax_num_cpu_devices', args.n_processes)
+            except Exception:
+                pass
 
     print("=" * 55)
     print("GaiaHub Improved")
@@ -615,6 +630,7 @@ def main():
             clean_psf=args.clean_psf,
             apply_psf_delta=args.apply_psf_delta,
             n_psf_iter=args.n_psf_iter,
+            parallel=not args.single_image,
             fmin=args.fmin, fmin_thresh=args.fmin_thresh, mag_st_max=args.mag_st_max, hmin=args.hmin,
             n_passes=args.n_passes, n_discovery_passes=args.n_discovery_passes,
             max_iter_fit=args.psf_max_iter,

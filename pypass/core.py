@@ -1931,6 +1931,7 @@ def run_photometry(
                     sigma_clip_sigma=sigma_clip_sigma,
                     sigma_clip_iter=sigma_clip_iter,
                     psf_cache=_psf_cache,
+                    n_jobs=n_jobs,
                 )
             else:
                 refit_stars(
@@ -2019,6 +2020,7 @@ def run_photometry(
                     gain=gain, read_noise=read_noise,
                     x_offset=x_offset, y_offset=y_offset,
                     psf_coeffs_cube=psf_coeffs_cube,
+                    n_jobs=n_jobs,
                 )
                 _jax_res = fit_batch_jax(
                     _jax_inputs, gain=gain, tol=tol, max_iter=max_iter_fit,
