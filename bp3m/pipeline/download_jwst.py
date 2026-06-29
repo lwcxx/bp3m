@@ -159,7 +159,9 @@ def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
     lib_dir = Path(lib_dir)
     psf_root = lib_dir / "STDPSFs"
     gdc_root = lib_dir / "STDGDCs"
-
+    print(f"  lib_dir: {lib_dir}")
+    print(f"  STDPSFs subdirs: {[d.name for d in sorted(psf_root.iterdir()) if d.is_dir()] if psf_root.exists() else 'NOT FOUND'}")
+    print(f"  STDGDCs subdirs: {[d.name for d in sorted(gdc_root.iterdir()) if d.is_dir()] if gdc_root.exists() else 'NOT FOUND'}")
     if not psf_root.exists() or not gdc_root.exists():
         return {}
 
@@ -270,19 +272,19 @@ def search_mast(
                                               for i in allowed_inst
                                               if i in available_combos]) or set())
         if not hst_filters:
-            hst_filters = ['F090W','F115W','F140W','F150W','F158W','F200W','F277W',\
-                          'F356W','F380W','F430W', 'F444W','F480W', 'F560W', 'F770W', 'F1000W']
+            hst_filters = ['F090W','F115W','F140M','F150W','F158M','F200W','F277W',\
+                          'F356W','F380M','F430M', 'F444W','F480W', 'F560W', 'F770W', 'F1000W']
     if project is None:
         project = [telescope]
 
-    # Shrink box slightly to avoid edge artefacts (GaiaHub convention)
+    # Shrink box slightly to avoid edge artefacts (GaiaWebb convention)
     cos_dec = np.cos(np.deg2rad(dec))
     margin_ra  = 0.056 / cos_dec
     margin_dec = 0.056
-    ra1  = ra  - search_width  / 2 + margin_ra
-    ra2  = ra  + search_width  / 2 - margin_ra
-    dec1 = dec - search_height / 2 + margin_dec
-    dec2 = dec + search_height / 2 - margin_dec
+    ra1  = ra  - search_width  / 2 - margin_ra
+    ra2  = ra  + search_width  / 2 + margin_ra
+    dec1 = dec - search_height / 2 - margin_dec
+    dec2 = dec + search_height / 2 + margin_dec
 
     # When time_baseline_days is None, keep all images up to the Gaia epoch
     if time_baseline_days is not None:
@@ -301,15 +303,21 @@ def search_mast(
     _mast_delay   = 10  # seconds between retries
     for _attempt in range(_mast_retries):
         try:
+            print('allowed_inst', allowed_inst)
+            print('hst_filters', hst_filters)
+            print(f"  ra1={ra1:.4f}  ra2={ra2:.4f}")
+            print(f"  dec1={dec1:.4f}  dec2={dec2:.4f}")
+            print(f"  project={project}")
+            print(f"  t_max_mjd={t_max_mjd:.1f}  ({Time(t_max_mjd, format='mjd').iso})")
             obs_raw = Observations.query_criteria(
                 dataproduct_type=['image'],
                 obs_collection=[telescope],
                 s_ra=[ra1, ra2],
                 s_dec=[dec1, dec2],
-                instrument_name=allowed_inst,
+                #instrument_name=allowed_inst,
                 t_max=[t_min_bound, t_max_mjd],
                 filters=hst_filters,
-                project=project,
+                #project=project,
             )
             break
         except Exception as _e:
@@ -396,7 +404,7 @@ def search_mast(
     # Filter products to only PSF+GDC-available instrument+filter combos
     if available_combos:
         def _combo_ok(row):
-            inst_name = row.get('instrument_name', '')
+            inst_name = row.get('instrument_name', '').split('/')[0]  # 'NIRCAM/IMAGE' → 'NIRCAM'
             filt_name = row.get('filters', '')
             if inst_name not in available_combos:
                 return False
@@ -419,7 +427,7 @@ def search_mast(
     return obs_df.reset_index(drop=True), prod_df.reset_index(drop=True)
 
 
-def download_hst_images(
+def download_jwst_images(
     ra: float,
     dec: float,
     search_width: float,
@@ -484,7 +492,6 @@ def download_hst_images(
             print(f"  PSF+GDC availability: {total} instrument+filter combos in lib_dir")
         else:
             print(f"  WARNING: No PSF+GDC combos found in {lib_dir}")
-
     current_params = _make_query_params(
         ra, dec, search_width, search_height,
         hst_filters, t_exptime_min, t_exptime_max,
