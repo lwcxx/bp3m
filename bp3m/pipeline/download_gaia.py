@@ -329,7 +329,7 @@ def download_gaia(
         chunks = [_query_mag_bin(a) for a in args]
 
     df = pd.concat(chunks, ignore_index=True)
-    df = df.drop_duplicates(subset=['source_id'])
+    df = df.drop_duplicates(subset=['SOURCE_ID'])
     print(f"  Raw stars before quality filter: {len(df)}")
 
     # Apply quality flags (needs phot_bp_rp_excess_factor column)
