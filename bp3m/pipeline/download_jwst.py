@@ -284,16 +284,16 @@ def search_mast(
     dec1 = dec - search_height / 2 + margin_dec
     dec2 = dec + search_height / 2 - margin_dec
 
-    # When time_baseline_days is None, keep all images up to the Gaia epoch
-    if time_baseline_days is not None:
-        t_max_mjd = _GAIA_DR3_MJD - time_baseline_days
-    else:
-        t_max_mjd = (Time.now()-366*u.day).mjd
+    # JWST observations are always later than Gaia epoch
+    t_max_mjd = Time.now().mjd
 
     # Build MAST time bounds
     t_min_bound = 0
     if obs_date_min is not None:
         t_min_bound = Time(obs_date_min).mjd
+    if time_baseline_days is not None:
+        t_min_bound = max(t_min_bound, _GAIA_DR3_MJD + time_baseline_days)
+
 
     print(f"  Querying MAST (this can take a minute)...")
     import time as _time
@@ -363,7 +363,7 @@ def search_mast(
     obs_time.format = 'iso'; obs_time.out_subfmt = 'date'
     obs_df['obs_time']   = obs_time.value
     obs_df['t_baseline'] = np.round(
-        (date_second_epoch_mjd - obs_df['t_max'].values) / 365.2422, 2)
+        -(date_second_epoch_mjd - obs_df['t_max'].values) / 365.2422, 2)
     obs_df['filters'] = obs_df['filters'].apply(_clean_mast_filter)
 
     # Merge exposure-time info into products table
