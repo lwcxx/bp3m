@@ -553,20 +553,28 @@ def main():
     # run and the failed-obs check has never been written), scan on-disk FLC
     # files now so downstream steps never accidentally process bad images.
     if not _failed_manifest.exists() and _manifest.exists() and _selected_obsids:
-        from bp3m.pipeline.download_hst import _check_exptime as _cet
-        _mast_root = _hst_dir / "mastDownload" / args.telescope.upper()
-        _scanned_failed: dict[str, str] = {}
-        for _oid in list(_selected_obsids):
-            _flc = _mast_root / _oid / f"{_oid}_{args.hst_im_type.lstrip('_')}.fits"
-            if _flc.exists():
-                _reason = _cet(_flc)
-                if _reason:
-                    _scanned_failed[_oid] = _reason
-        if _scanned_failed:
-            # Remove from selected list and write both manifests
-            _selected_obsids = [o for o in _selected_obsids if o not in _scanned_failed]
-            _manifest.write_text(_json.dumps(_selected_obsids, indent=2))
-            _failed_manifest.write_text(_json.dumps(_scanned_failed, indent=2))
+        if args.telescope.upper() == 'HST':
+            from bp3m.pipeline.download_hst import _check_exptime as _cet
+            im_type = args.hst_im_type
+        elif args.telescope.upper() == 'JWST':
+            from bp3m.pipeline.download_jwst import _check_exptime as _cet
+            im_type = args.jwst_im_type
+        else:
+            _cet = None
+        if _cet is not None:
+            _mast_root = _hst_dir / "mastDownload" / args.telescope.upper()
+            _scanned_failed: dict[str, str] = {}
+            for _oid in list(_selected_obsids):
+                _flc = _mast_root / _oid / f"{_oid}_{im_type.lstrip('_')}.fits"
+                if _flc.exists():
+                    _reason = _cet(_flc)
+                    if _reason:
+                        _scanned_failed[_oid] = _reason
+            if _scanned_failed:
+                # Remove from selected list and write both manifests
+                _selected_obsids = [o for o in _selected_obsids if o not in _scanned_failed]
+                _manifest.write_text(_json.dumps(_selected_obsids, indent=2))
+                _failed_manifest.write_text(_json.dumps(_scanned_failed, indent=2))
 
     if _failed_manifest.exists():
         try:
@@ -581,7 +589,7 @@ def main():
 
     # ── Check that we have images before continuing ───────────────────────────
     if _selected_obsids is not None and len(_selected_obsids) == 0:
-        print("\nNo HST images available to process. Check your search "
+        print("\nNo HST/JWST images available to process. Check your search "
               "parameters (filters, instruments, search radius, dates).")
         return
 
@@ -615,8 +623,9 @@ def main():
             try:
                 _dp  = _pd.read_csv(str(_dp_csv))
                 _obs = _pd.read_csv(str(_obs_csv))
-                _flc = _dp[_dp['productFilename'].str.endswith('_flc.fits', na=False)
-                           | _dp['productFilename'].str.endswith('_flt.fits', na=False)]
+                _flc = (_dp[_dp['productFilename'].str.endswith('_flc.fits', na=False)
+                           | _dp['productFilename'].str.endswith('_flt.fits', na=False)]) if args.telescope.upper() == 'HST' \
+                           else (_dp[_dp['productFilename'].str.endswith('_cal.fits', na=False)])
                 _merged = _flc.merge(
                     _obs[['obsid', 'instrument_name']],
                     left_on='parent_obsid', right_on='obsid', how='left')
@@ -630,7 +639,9 @@ def main():
         if not _obsid_to_instdet:
             # Fallback: read FITS headers.
             _mast_root = _hst_dir / "mastDownload" / args.telescope.upper()
-            _im_suffix = args.hst_im_type.lstrip('_') + '.fits'
+            _im_suffix = (args.hst_im_type if args.telescope.upper() == 'HST' \
+                          else args.jwst_im_type).lstrip('_')
+            _im_suffix += '.fits'
             for _oid in _restrict:
                 _flc_path = _mast_root / _oid / f"{_oid}_{_im_suffix}"
                 if _flc_path.exists():

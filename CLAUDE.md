@@ -38,12 +38,16 @@ Each of the 5 steps maps to a module in `bp3m/pipeline/`:
 | Step | Module | What it does |
 |------|--------|--------------|
 | 1 | `download_gaia.py` | TAP query to Gaia DR3; caches as CSV |
-| 2 | `download_hst.py` | MAST search + download of FLC/FLT FITS files |
+| 2 | `download_hst.py` / `download_jwst.py` | MAST search + download; dispatched by `--telescope` |
 | 3 | `psf_fitting.py` | Parallelises `pypass` over images via joblib |
 | 4 | `cross_match.py` | Parallelises `gaia_cross_match` over images |
 | 5 | `run_alignment.py` | Calls `BP3MSolver` from `bp3m/solver.py` |
 
 Steps can be individually skipped with `--skip_download`, `--skip_psf`, `--skip_crossmatch`, `--skip_alignment`. An obsid manifest (`{field}_selected_obsids.json`) persists image selection across runs.
+
+Step 2 dispatches on `--telescope`:
+- `HST` (default) → `download_hst_images()` using `--hst_im_type` (default `_flc`)
+- `JWST` → `download_jwst_images()` using `--jwst_im_type` (default `_cal`); supports NIRCam, NIRISS, MIRI
 
 ### Core solver (`bp3m/solver.py`)
 
@@ -79,15 +83,19 @@ A sparse variant lives in `solver_sparse.py` (activated by `--sparse`); `astro_u
 
 ```
 {output_dir}/{field}/
-  Gaia/                        ← Gaia CSV cache
-  HST/mastDownload/HST/{obsid}/
-    {obsid}_flc.fits            ← raw image
-    {obsid}_flc_catalog.fits    ← pypass output
-    matched_gaia.csv            ← cross-match output
+  Gaia/                              ← Gaia CSV cache
+  HST/mastDownload/HST/{obsid}/      ← HST images (--telescope HST)
+    {obsid}_flc.fits                 ← raw image (or _flt with --hst_im_type _flt)
+    {obsid}_flc_catalog.fits         ← pypass output
+    matched_gaia.csv                 ← cross-match output
+  JWST/mastDownload/JWST/{obsid}/    ← JWST images (--telescope JWST)
+    {obsid}_cal.fits                 ← raw image (or other type via --jwst_im_type)
+    {obsid}_cal_catalog.fits         ← pypass output
+    matched_gaia.csv                 ← cross-match output
   BP3M_results/
-    stellar_astrometry.csv      ← primary science output
+    stellar_astrometry.csv           ← primary science output
     image_transformations.csv
-    v_cov_marginalised.npy      ← (N, 5, 5) full covariance
+    v_cov_marginalised.npy           ← (N, 5, 5) full covariance
     plots/
 ```
 
