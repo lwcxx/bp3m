@@ -29,7 +29,7 @@ Extension note
 JWST support is planned. Pass --telescope JWST once py1pass and
 fast_cross_match have been updated for JWST data.
 """
-
+from __future__ import annotations
 import argparse
 import re
 import sys
@@ -38,9 +38,9 @@ from pathlib import Path
 from multiprocessing import cpu_count
 
 import numpy as np
+from typing import Optional
 
-
-def _config_lib_dir() -> str | None:
+def _config_lib_dir() -> "Optional[str]":
     """Read lib_dir from config.toml if it exists (written by bp3m-setup).
 
     Config location: $BP3M_HOME/config.toml, or ~/.bp3m/config.toml by default.
@@ -96,7 +96,7 @@ def _parse_args():
     g.add_argument('--only_5p', action='store_true',
                    help='Restrict to 5-parameter Gaia solutions only')
 
-    # ── HST ───────────────────────────────────────────────────────────────────
+    # ── HST/JWST ───────────────────────────────────────────────────────────────────
     h = p.add_argument_group('HST / telescope options')
     h.add_argument('--telescope', type=str, default='HST',
                    help='Telescope (default HST; JWST planned)')
@@ -126,6 +126,13 @@ def _parse_args():
                    help='Field IDs to download. Integers from the table '
                         '(space-separated), "y"/"all" to download everything, '
                         'or "n"/"0" to skip download. Default: interactive prompt.')
+    h.add_argument('--jwst_im_type', type=str, default='_cal',
+                   help='Image type: _cal (default)')
+    h.add_argument('--jwst_exptime_min', type=float, default=2.0,
+                   help='Minimum average exposure time per image set (s)')
+    h.add_argument('--jwst_exptime_max', type=float, default=np.inf,
+                   help='Maximum average exposure time per image set (s)')
+
 
     # ── PSF fitting ───────────────────────────────────────────────────────────
     psf = p.add_argument_group('PSF fitting (py1pass)')
@@ -471,9 +478,10 @@ def main():
             quiet=args.quiet,
         )
 
-    # ── Step 2: Download HST ─────────────────────────────────────────────────
+    # ── Step 2: Download HST/JWST ─────────────────────────────────────────────────
     if not args.skip_download:
         from bp3m.pipeline.download_hst import download_hst_images
+        from bp3m.pipeline.download_jwst import download_jwst_images
         # Load Gaia catalog for footprint star counts if not already in memory
         if gaia_df is None:
             from bp3m.pipeline.explore_utils import load_gaia_catalog
@@ -489,25 +497,46 @@ def main():
                 _gaia_csv = _candidates[0] if _candidates else _gaia_csv
             if _gaia_csv.exists():
                 gaia_df = load_gaia_catalog(_gaia_csv)
-        download_hst_images(
-            ra=args.ra, dec=args.dec,
-            search_width=args.search_width, search_height=args.search_height,
-            output_dir=output_dir, field_name=field,
-            hst_filters=args.hst_filters,
-            t_exptime_min=args.hst_exptime_min,
-            t_exptime_max=args.hst_exptime_max,
-            time_baseline_days=args.time_baseline,
-            obs_date_min=args.obs_date_min,
-            obs_date_max=args.obs_date_max,
-            im_type=args.hst_im_type,
-            telescope=args.telescope,
-            instruments=args.instruments,
-            lib_dir=Path(args.lib_dir),
-            gaia_df=gaia_df,
-            field_ids=_parse_field_ids(args.field_ids),
-            quiet=args.quiet,
-            force_redownload=args.force_redownload_hst,
-        )
+        if args.telescope == 'HST':
+            download_hst_images(
+                ra=args.ra, dec=args.dec,
+                search_width=args.search_width, search_height=args.search_height,
+                output_dir=output_dir, field_name=field,
+                hst_filters=args.hst_filters,
+                t_exptime_min=args.hst_exptime_min,
+                t_exptime_max=args.hst_exptime_max,
+                time_baseline_days=args.time_baseline,
+                obs_date_min=args.obs_date_min,
+                obs_date_max=args.obs_date_max,
+                im_type=args.hst_im_type,
+                telescope=args.telescope,
+                instruments=args.instruments,
+                lib_dir=Path(args.lib_dir),
+                gaia_df=gaia_df,
+                field_ids=_parse_field_ids(args.field_ids),
+                quiet=args.quiet,
+                force_redownload=args.force_redownload_hst,
+            )
+        if args.telescope == 'JWST':
+            download_jwst_images(
+                ra=args.ra, dec=args.dec,
+                search_width=args.search_width, search_height=args.search_height,
+                output_dir=output_dir, field_name=field,
+                hst_filters=args.hst_filters,
+                t_exptime_min=args.hst_exptime_min,
+                t_exptime_max=args.hst_exptime_max,
+                time_baseline_days=args.time_baseline,
+                obs_date_min=args.obs_date_min,
+                obs_date_max=args.obs_date_max,
+                im_type=args.jwst_im_type,
+                telescope=args.telescope,
+                instruments=args.instruments,
+                lib_dir=Path(args.lib_dir),
+                gaia_df=gaia_df,
+                field_ids=_parse_field_ids(args.field_ids),
+                quiet=args.quiet,
+                force_redownload=args.force_redownload_hst,
+            )
 
     # Read manifest of selected obsids written by step 2 (persists across runs)
     import json as _json
