@@ -27,7 +27,7 @@ The iterative algorithm:
   4. Solve for v_hat_i, C_vT,i (conditional on r_hat)
   5. Update R_j from new (a,b,c,d) in r_hat; repeat from 2
 """
-
+from __future__ import annotations # to account for the Python version
 import numpy as np
 from scipy import linalg
 import astropy.units as u
