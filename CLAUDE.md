@@ -66,7 +66,7 @@ Step 3 (`run_psf_fitting`) in `psf_fitting_cal.py` now supports JWST via `jwst1p
 
 ### Additional pipeline modules
 
-- `pipeline/psf_fitting_cal.py` — JWST CAL entry point. For `telescope='JWST'`, `run_psf_fitting` calls `_fit_one_image_jwst`, which runs `jwst1pass_py_v2.jwst1pass.io.run_photometry_fits` and writes a pypass-schema catalog via `_build_jwst_catalog_table`. For `telescope='HST'` it falls through to `_fit_one_image` (pypass path). Key helpers: `_ensure_jwst1pass()` — sys.path injection for jwst1pass_py_v2; `_build_jwst_catalog_table()` — column adapter (renames `q→qfit`, adds `mag_st_gdc`, `is_star_candidate`, `chip_ext`, `eps_psf`, `sigma_*_model`, floor metadata). `_HST_DEFAULTS` (confusingly named) are tuned for JWST CAL: `fmin_thresh=5.0`, `hmin=5`, `half_width=5` (vs. `psf_fitting.py`'s `fmin_thresh=100.0`, `hmin=4`, `half_width=3` for HST FLC).
+- `pipeline/psf_fitting_cal.py` — JWST-only CAL entry point (HST uses `psf_fitting.py`). `run_psf_fitting` calls `_fit_one_image`, which is a thin wrapper around `_fit_one_image_jwst`. `_fit_one_image_jwst` computes `zero_point` per-image from `PIXAR_SR` (`ZP_AB = -2.5 * log10(PIXAR_SR × 1e6 / 3631)`), then calls `jwst1pass_py_v2.jwst1pass.io.run_photometry_fits` and writes a pypass-schema catalog via `_build_jwst_catalog_table`. Key helpers: `_ensure_jwst1pass()` — sys.path injection for jwst1pass_py_v2; `_build_jwst_catalog_table()` — column adapter (renames `q→qfit`, adds `mag_st_gdc`, `is_star_candidate`, `chip_ext`, `eps_psf`, `sigma_*_model`, floor metadata). `_JWST_DEFAULTS` are tuned for JWST CAL: `fmin_thresh=5.0`, `hmin=5`, `half_width=5`, `mag_limit=28.0` (vs. `psf_fitting.py`'s `_HST_DEFAULTS`: `fmin_thresh=100.0`, `hmin=4`, `half_width=3` for HST FLC).
 - `pipeline/hst_catalog_crossmatch.py` — Cross-match ALL HST sources between images (not just Gaia-matched ones). Three-phase: (1) within-filter, (2) cross-filter, (3) Gaia recovery. Outputs go to `hst_xmatch/`. Used by the v2 pipeline to build the master catalog for BP3M v2.
 - `pipeline/run_alignment_v2.py` — BP3M v2 alignment using `master_combined_v2.csv`. Adds HST-only sources (no Gaia prior) with a phased-inclusion callback (`V2AlignmentCallback`) that enables them after iteration `hst_enable_iter`. Writes to `BP3M_v2_results/`.
 - `pipeline/run_iterate_v2.py` — Entry point for `bp3m-v2`. Orchestrates: (1) initial master cross-match → (2) BP3M v2 alignment → (3) updated master cross-match; repeated `--n_refine` times.
@@ -235,9 +235,10 @@ sigma_clip=True, sigma_clip_sigma=4.0,
 conc_limit=0.9, n_jobs=-1, backend='auto'
 ```
 
-`psf_fitting_cal.py` `_HST_DEFAULTS` (tuned for JWST CAL images — despite the variable name):
+`psf_fitting_cal.py` `_JWST_DEFAULTS` (tuned for JWST CAL images):
 ```python
-fmin_thresh=5.0, hmin=5, half_width=5  # other params same as psf_fitting.py
+fmin_thresh=5.0, hmin=5, half_width=5, mag_limit=28.0,
+n_passes=2, sky_inner=4, sky_outer=8, conc_limit=0.9, n_jobs=-1
 ```
 
 ### Output layout
@@ -311,12 +312,13 @@ Stars are typed by which Gaia solution they have, checked in `solver.py::_cache_
   - `qfit` convention matches pypass: genuine quality metric (`small ≈ good`); old `qfit=0.0` sentinel removed
   - `conc_limit` threaded through `run_photometry_fits` → `_run_nircam_meta` → `run_photometry` → `classify_stars`
   - Validated on Draco NIRISS F200W: 81/515 star candidates correctly identified
-- **Step 3 PSF fitting (`psf_fitting_cal.py`)** — `run_psf_fitting(telescope='JWST')` is now implemented (July 2026):
+- **Step 3 PSF fitting (`psf_fitting_cal.py`)** — JWST-only module (July 2026):
   - `_ensure_jwst1pass()` adds `GaiaWebb-master/jwst1pass_py_v2` to `sys.path` (respects `JWST1PASS_DIR` env var)
   - `_build_jwst_catalog_table(records, zero_point, sigma_floor_x, sigma_floor_y, eps_flux, floor_params)` — column adapter from jwst1pass schema to pypass schema: `q→qfit`, `mag_gdc→mag_st_gdc`, adds `is_star_candidate`, `chip_ext`, `eps_psf=NaN`, `sigma_*_model=NaN`, floor metadata
-  - `_fit_one_image_jwst()` — full JWST counterpart of `_fit_one_image`; calls `jwst1pass_py_v2` then writes: catalog, params sidecar, residual FITS (per-chip SCI/VAR/MASK with DQ + sigma-clip masks), all diagnostic plots, PSF perturbation `psf_delta.npy`
+  - `_fit_one_image` — thin wrapper that delegates to `_fit_one_image_jwst`; accepts the same 7-tuple args as `_image_worker` for API compatibility
+  - `_fit_one_image_jwst()` — JWST engine: reads `PIXAR_SR` from the FITS primary header to compute `zero_point` (`ZP_AB = -2.5 * log10(PIXAR_SR × 1e6 / 3631)`), calls `jwst1pass_py_v2`, writes catalog, params sidecar, residual FITS (per-chip SCI/VAR/MASK with DQ + sigma-clip masks), all diagnostic plots, and PSF perturbation `psf_delta.npy`
   - `estimate_systematic_floor` is called on jwst1pass records (uses covariance matrix entries, which jwst1pass computes); `fx/fy/ff` propagated to catalog and `plot_catalog_stats`
-  - Image discovery for JWST uses `download_jwst.find_flc_images`; `_telescope` key in params dict routes `_fit_one_image` to the JWST engine (excluded from cache key via `_FIT_CACHE_EXCLUDE`)
+  - Image discovery uses `download_jwst.find_flc_images`; `_JWST_DEFAULTS` provides all JWST-specific parameter defaults including `mag_limit=28.0`
 
 **What is not yet implemented:**
 - `psf_fitting.py` (HST-only) — still raises `NotImplementedError` for non-HST; use `psf_fitting_cal.py` for JWST
