@@ -356,22 +356,31 @@ def _reclassify_one_image_worker(args):
     import time as _time, traceback
     global _status_queue
 
-    (img_path, conc_lo, lib_dir_str, gdc_helpers_keys) = args
-    img_path = Path(img_path)
-    img_name = img_path.name
-    catalog  = img_path.parent / f"{img_path.stem}_catalog.fits"
+    (img_path, conc_lo, lib_dir_str, gdc_helpers_keys, telescope) = args
+    img_path  = Path(img_path)
+    img_name  = img_path.name
+    catalog   = img_path.parent / f"{img_path.stem}_catalog.fits"
+    is_jwst   = telescope.upper() == 'JWST'
 
     t0 = _time.perf_counter()
     if _status_queue is not None:
         _status_queue.put(('start', img_name))
 
     try:
-        _ensure_py1pass()
-        from pypass.core import classify_stars, inflate_chi2
-        from pypass.diagnostics import (estimate_systematic_floor,
-                                         plot_catalog_stats,
-                                         plot_concentration_diagnostics)
         from astropy.table import Table as _T
+
+        if is_jwst:
+            _ensure_jwst1pass()
+            from jwst1pass.core import classify_stars, inflate_chi2
+            from jwst1pass.diagnostics import (estimate_systematic_floor,
+                                               plot_catalog_stats,
+                                               plot_concentration_diagnostics)
+        else:
+            _ensure_py1pass()
+            from pypass.core import classify_stars, inflate_chi2
+            from pypass.diagnostics import (estimate_systematic_floor,
+                                             plot_catalog_stats,
+                                             plot_concentration_diagnostics)
 
         t = _T.read(str(catalog))
         records, old_fx, old_fy, old_eps, old_chi2_scales = _records_from_fits_table(t)
@@ -385,8 +394,13 @@ def _reclassify_one_image_worker(args):
         gdc_reapplied = False
         if lib_dir_str and gdc_helpers_keys:
             try:
-                from pypass.io import (_apply_gdc_wcs, find_gdc, load_stdgdc,
-                                        get_chip_config_from_fits, _DETECTOR_PREFIX)
+                if is_jwst:
+                    _ensure_jwst1pass()
+                    from jwst1pass.io import (_apply_gdc_wcs, find_gdc, load_stdgdc,
+                                              get_chip_config, _DETECTOR_PREFIX)
+                else:
+                    from pypass.io import (_apply_gdc_wcs, find_gdc, load_stdgdc,
+                                           get_chip_config_from_fits, _DETECTOR_PREFIX)
                 from astropy.io import fits as _fits
                 with _fits.open(str(img_path)) as hdul:
                     primary_hdr = hdul[0].header
@@ -394,12 +408,16 @@ def _reclassify_one_image_worker(args):
                 detector   = primary_hdr.get('DETECTOR', '').strip().upper()
                 det_prefix = _DETECTOR_PREFIX.get((instrume, detector))
                 if det_prefix:
-                    gdc_dir  = Path(lib_dir_str) / 'STDGDCs' / det_prefix
+                    gdc_subdir = 'NIRCam' if instrume == 'NIRCAM' else det_prefix
+                    gdc_dir  = Path(lib_dir_str) / 'STDGDCs' / gdc_subdir
                     gdc_path = find_gdc(str(gdc_dir), primary_hdr) if gdc_dir.is_dir() else None
                     if gdc_path and os.path.exists(gdc_path):
-                        gdc   = load_stdgdc(gdc_path)
-                        chips = get_chip_config_from_fits(str(img_path), instrume, detector)
-                        _apply_gdc_wcs(records, gdc, str(img_path), chips, instrume, detector)
+                        gdc = load_stdgdc(gdc_path)
+                        if is_jwst:
+                            _apply_gdc_wcs(records, gdc, header=primary_hdr)
+                        else:
+                            chips = get_chip_config_from_fits(str(img_path), instrume, detector)
+                            _apply_gdc_wcs(records, gdc, str(img_path), chips, instrume, detector)
                         gdc_reapplied = True
             except Exception:
                 pass
@@ -460,8 +478,8 @@ def _reclassify_one_image_worker(args):
 def reclassify_psf_catalogs(
     output_dir: Path,
     field_name: str,
-    telescope: str = 'HST',
-    im_type: str = '_flc',
+    telescope: str = 'JWST',
+    im_type: str | None = None,
     conc_limit: float | None = None,
     restrict_to_obsids: list[str] | None = None,
     psf_dir: Path | None = None,
@@ -485,36 +503,45 @@ def reclassify_psf_catalogs(
     ----------
     output_dir        : pipeline root directory
     field_name        : field subdirectory name
-    telescope         : 'HST' or 'JWST'
-    im_type           : '_flc' or '_flt'
+    telescope         : 'JWST' (default) or 'HST'.  Determines which photometry
+                        engine (jwst1pass vs pypass) and image-finding function
+                        are used.  This module is primarily JWST-targeted; for
+                        HST images the pypass path is still supported.
+    im_type           : image suffix to search for.  Defaults to '_cal' for JWST
+                        and '_flc' for HST when None.
     conc_limit        : new concentration lower bound (default 0.9)
     restrict_to_obsids: if given, only reclassify these obs_ids
-    psf_dir           : unused (pypass is installed as a package); kept for API compatibility
+    psf_dir           : unused (engines are installed as packages); kept for API
+                        compatibility
     lib_dir           : path to STDPSFs/STDGDCs library (for GDC re-propagation).
-                        If None the GDC covariance is rescaled by the chi2_scale ratio
-                        rather than re-propagated through the Jacobian.
+                        If None the GDC covariance is rescaled by the chi2_scale
+                        ratio rather than re-propagated through the Jacobian.
 
     Returns
     -------
     List of updated catalog FITS paths
     """
-    _ensure_py1pass()
-    # psf_dir parameter retained for API compatibility but no longer needed;
-    # pypass is installed as a package.
+    # psf_dir parameter retained for API compatibility but no longer needed.
+    is_jwst = telescope.upper() == 'JWST'
 
-    from pypass.core import classify_stars, inflate_chi2
-    from pypass.diagnostics import (estimate_systematic_floor,
-                                     plot_catalog_stats,
-                                     plot_concentration_diagnostics)
+    if is_jwst:
+        _ensure_jwst1pass()
+    else:
+        _ensure_py1pass()
+
     from astropy.table import Table
 
-    conc_lo = conc_limit if conc_limit is not None else _JWST_DEFAULTS['conc_limit']
+    conc_lo   = conc_limit if conc_limit is not None else _JWST_DEFAULTS['conc_limit']
+    _im_type  = im_type if im_type is not None else ('_cal' if is_jwst else '_flc')
 
-    from .download_hst import find_flc_images
+    if is_jwst:
+        from .download_jwst import find_flc_images
+    else:
+        from .download_hst import find_flc_images
     images = find_flc_images(output_dir, field_name, telescope=telescope,
-                              im_type=im_type)
+                              im_type=_im_type)
     if not images:
-        print(f"[reclassify] No {im_type} images found under "
+        print(f"[reclassify] No {_im_type} images found under "
               f"{output_dir}/{field_name}/{telescope}/")
         return []
 
@@ -525,24 +552,36 @@ def reclassify_psf_catalogs(
     gdc_note = "with GDC re-propagation" if lib_dir else "GDC approximated (no lib_dir)"
     print("\n" + "─"*50)
     print(f"Step 3b: Re-classifying stars ({len(images)} images, "
-          f"conc_limit={conc_lo}, {gdc_note})")
+          f"conc_limit={conc_lo}, telescope={telescope}, {gdc_note})")
     print("─"*50)
 
-    # Pre-load py1pass GDC helpers if lib_dir given
+    # Pre-check GDC helpers from the appropriate engine
     _gdc_helpers = None
     if lib_dir is not None:
         try:
-            from pypass.io import (_apply_gdc_wcs, find_gdc, load_stdgdc,
-                                    get_chip_config_from_fits, _DETECTOR_PREFIX)
-            _gdc_helpers = dict(
-                apply_gdc_wcs=_apply_gdc_wcs,
-                find_gdc=find_gdc,
-                load_stdgdc=load_stdgdc,
-                get_chip_config_from_fits=get_chip_config_from_fits,
-                DETECTOR_PREFIX=_DETECTOR_PREFIX,
-            )
+            if is_jwst:
+                from jwst1pass.io import (_apply_gdc_wcs, find_gdc, load_stdgdc,
+                                          get_chip_config, _DETECTOR_PREFIX)
+                _gdc_helpers = dict(
+                    apply_gdc_wcs=_apply_gdc_wcs,
+                    find_gdc=find_gdc,
+                    load_stdgdc=load_stdgdc,
+                    get_chip_config=get_chip_config,
+                    DETECTOR_PREFIX=_DETECTOR_PREFIX,
+                )
+            else:
+                from pypass.io import (_apply_gdc_wcs, find_gdc, load_stdgdc,
+                                       get_chip_config_from_fits, _DETECTOR_PREFIX)
+                _gdc_helpers = dict(
+                    apply_gdc_wcs=_apply_gdc_wcs,
+                    find_gdc=find_gdc,
+                    load_stdgdc=load_stdgdc,
+                    get_chip_config_from_fits=get_chip_config_from_fits,
+                    DETECTOR_PREFIX=_DETECTOR_PREFIX,
+                )
         except Exception as _e:
-            print(f"  WARNING: could not load GDC helpers from py1pass: {_e}. "
+            _engine = 'jwst1pass' if is_jwst else 'pypass'
+            print(f"  WARNING: could not load GDC helpers from {_engine}: {_e}. "
                   "GDC covariance will be approximated.")
 
     # Filter to images that have a catalog
@@ -560,7 +599,8 @@ def reclassify_psf_catalogs(
 
     lib_dir_str = str(lib_dir) if lib_dir else None
     gdc_helpers_keys = True if _gdc_helpers is not None else None
-    worker_args = [(str(img), conc_lo, lib_dir_str, gdc_helpers_keys) for img in work]
+    worker_args = [(str(img), conc_lo, lib_dir_str, gdc_helpers_keys, telescope)
+                   for img in work]
 
     updated = []
     n_work  = len(work)
@@ -718,8 +758,8 @@ def remeasure_psf_perturbation(
     output_dir: Path,
     field_name: str,
     lib_dir: Path,
-    telescope: str = 'HST',
-    im_type: str = '_flc',
+    telescope: str = 'JWST',
+    im_type: str = '_cal',
     restrict_to_obsids: list[str] | None = None,
     psf_dir: Path | None = None,
     half_width: int | None = None,
@@ -742,10 +782,10 @@ def remeasure_psf_perturbation(
     output_dir   : pipeline root directory
     field_name   : field subdirectory name
     lib_dir      : directory containing STDPSFs/ and STDGDCs/
-    telescope    : 'HST' (JWST not yet supported)
-    im_type      : '_flc' or '_flt'
+    telescope    : 'JWST' or 'HST'
+    im_type      : '_cal' (JWST) or '_flc'/'_flt' (HST)
     restrict_to_obsids : if given, only process these obs_ids
-    psf_dir      : unused (pypass is installed as a package); kept for API compatibility
+    psf_dir      : unused (engines are installed as packages); kept for API compatibility
     half_width   : fitting half-width in detector pixels (default: _JWST_DEFAULTS)
     fmin_thresh  : hard lower bound on detection flux threshold (default: _JWST_DEFAULTS)
     hw_wing      : half-width for the wing accumulation pass (default 12, covering
@@ -759,14 +799,12 @@ def remeasure_psf_perturbation(
     -------
     List of image paths where perturbation was measured successfully.
     """
-    _ensure_py1pass()
-    # psf_dir parameter retained for API compatibility but no longer needed;
-    # pypass is installed as a package.
+    _ensure_jwst1pass()
 
-    from pypass.io import (load_image, load_stdpsf, find_psf,
-                            get_chip_config_from_fits, _DETECTOR_PREFIX)
-    from pypass.diagnostics import measure_psf_perturbation, plot_psf_perturbation
-    from pypass.multipass import subtract_stars
+    from jwst1pass.io import (load_image, load_stdpsf, find_psf,
+                               get_chip_config, _DETECTOR_PREFIX)
+    from jwst1pass.diagnostics import measure_psf_perturbation, plot_psf_perturbation
+    from jwst1pass.multipass import subtract_stars
     from scipy.ndimage import spline_filter as _spline_filter
     from astropy.io import fits as _fits
     from astropy.table import Table
@@ -774,7 +812,7 @@ def remeasure_psf_perturbation(
     _hw   = half_width if half_width is not None else _JWST_DEFAULTS['half_width']
     _fmin = fmin_thresh if fmin_thresh is not None else _JWST_DEFAULTS['fmin_thresh']
 
-    from .download_hst import find_flc_images
+    from .download_jwst import find_flc_images
     images = find_flc_images(output_dir, field_name, telescope=telescope,
                               im_type=im_type)
     if not images:
@@ -815,7 +853,8 @@ def remeasure_psf_perturbation(
                 print(f"  {img_name}: unknown instrument {instrume}/{detector} — skipping")
                 continue
 
-            psf_dir_stdpsf = lib_dir / 'STDPSFs' / det_prefix
+            psf_subdir = 'NIRCam' if instrume == 'NIRCAM' else det_prefix
+            psf_dir_stdpsf = lib_dir / 'STDPSFs' / psf_subdir
             psf_path = find_psf(str(psf_dir_stdpsf), primary_hdr)
             stdpsf_cube, xs, ys, psf_scale, _ = load_stdpsf(psf_path)
 
@@ -843,9 +882,9 @@ def remeasure_psf_perturbation(
                 _spline_filter(p, order=3, output=np.float64) for p in psf_cube
             ])
 
-            chips = get_chip_config_from_fits(str(img), instrume, detector)
+            chips = get_chip_config(instrume, detector)
 
-            # Load residual images saved by the original py1pass fit.
+            # Load residual images saved by the original jwst1pass fit.
             # These are the exact leave-one-out residuals computed during the
             # Newton iterations — preferred over a subtract_stars reconstruction
             # which subtracts all stars simultaneously and is not leave-one-out.
@@ -871,14 +910,14 @@ def remeasure_psf_perturbation(
                                 _m = _rh[mask_ext].data
                                 masks_by_chip[sci_ext] = (_m != 3)  # True=bad
                             else:
-                                _, _, _, _dq, _, _ = load_image(
-                                    str(img), sci_ext=sci_ext, dq_ext=dq_ext)
+                                _, _, _, _dq, _, _, _, _, _, _ = load_image(
+                                    str(img), ext=sci_ext, dq_ext=dq_ext)
                                 if _dq is not None:
                                     masks_by_chip[sci_ext] = _dq
                     # Convert combined-frame x/y → chip-local for records
                     for sci_ext, dq_ext, _y_off_chip in chips:
-                        _, _, _, _, x_off, y_off = load_image(
-                            str(img), sci_ext=sci_ext, dq_ext=dq_ext)
+                        _, _, _, _, _, x_off, y_off, _, _, _ = load_image(
+                            str(img), ext=sci_ext, dq_ext=dq_ext)
                         for r in [r for r in records
                                   if getattr(r, '_chip_ext', sci_ext) == sci_ext]:
                             r.x = r.x - x_off
@@ -900,8 +939,8 @@ def remeasure_psf_perturbation(
                 # Note this is not leave-one-out; the saved residual FITS is preferred.
                 print(f"    no saved residual FITS found — reconstructing via subtract_stars")
                 for sci_ext, dq_ext, _y_off_chip in chips:
-                    data, _gain, _rn, _mask, x_off, y_off = load_image(
-                        str(img), sci_ext=sci_ext, dq_ext=dq_ext)
+                    data, _, _, _mask, _, x_off, y_off, _, _, _ = load_image(
+                        str(img), ext=sci_ext, dq_ext=dq_ext)
                     chip_records = [r for r in records
                                     if getattr(r, '_chip_ext', sci_ext) == sci_ext]
                     for r in chip_records:
@@ -1028,7 +1067,7 @@ def _get_image_header_info(img_path):
         detector = hdr.get('DETECTOR', '').strip()
         instdet  = f"{instrume}/{detector}" if detector else instrume
         exptime  = float(hdr.get('EFFEXPTM', hdr.get('EXPTIME', 0)))
-        # Match _extract_filter logic in pypass/io.py:
+        # Match _extract_filter logic in jwst1pass/io.py:
         # ACS has two filter wheels — pick the non-CLEAR one.
         filt = '?'
         if instrume.upper() in ('ACS', ''):
@@ -1051,7 +1090,7 @@ def _get_image_header_info(img_path):
 
 
 def _effective_fmin(info: dict, params: dict) -> str:
-    """Compute the effective fmin string for the one-liner, matching pypass logic."""
+    """Compute the effective fmin string for the one-liner."""
     fmin_thresh = params.get('fmin_thresh', _JWST_DEFAULTS['fmin_thresh'])
     mag_st_max  = params.get('mag_st_max',  _JWST_DEFAULTS['mag_st_max'])
     photflam    = info.get('photflam')
@@ -1269,7 +1308,7 @@ def _fit_one_image_jwst(image_path, out_catalog, lib_dir, params, params_meta, v
     from jwst1pass.io import (run_photometry_fits as _jwst_run,
                               load_image as _jwst_load_image,
                               load_psf_cube as _jwst_load_psf_cube)
-    from pypass.diagnostics import estimate_systematic_floor
+    from jwst1pass.diagnostics import estimate_systematic_floor
     from astropy.io import fits as _fits
 
     img_name = Path(image_path).name
@@ -1444,7 +1483,7 @@ def _fit_one_image_jwst(image_path, out_catalog, lib_dir, params, params_meta, v
 
         # ── Diagnostic figures ────────────────────────────────────────────────
         try:
-            from pypass.diagnostics import plot_catalog_stats
+            from jwst1pass.diagnostics import plot_catalog_stats
             plot_catalog_stats(records, floor_params=floor,
                                output=str(img_dir / 'psf_catalog_stats.png'),
                                title=img_name)
@@ -1452,7 +1491,7 @@ def _fit_one_image_jwst(image_path, out_catalog, lib_dir, params, params_meta, v
             print(f"  WARNING: psf_catalog_stats.png failed: {_e}")
 
         try:
-            from pypass.diagnostics import plot_concentration_diagnostics
+            from jwst1pass.diagnostics import plot_concentration_diagnostics
             plot_concentration_diagnostics(
                 records,
                 conc_limit=params.get('conc_limit', _JWST_DEFAULTS['conc_limit']),
@@ -1465,7 +1504,7 @@ def _fit_one_image_jwst(image_path, out_catalog, lib_dir, params, params_meta, v
         # image and PSF.  plot_diagnostics and plot_psf_residual_map are
         # instrument-agnostic and work with any PSF cube in (n_psf, ny, nx) format.
         try:
-            from pypass.diagnostics import plot_diagnostics, plot_psf_residual_map
+            from jwst1pass.diagnostics import plot_diagnostics, plot_psf_residual_map
             with _fits.open(str(image_path)) as hdul:
                 primary_hdr = hdul[0].header
             _sci_ext_d, _dq_ext_d, _ = _all_chips[0]
@@ -1505,9 +1544,9 @@ def _fit_one_image_jwst(image_path, out_catalog, lib_dir, params, params_meta, v
         # Uses the on-disk catalog (non-converged stars already removed) so blobs
         # from failed fits do not contaminate neighbouring residual windows.
         try:
-            from pypass.diagnostics import (measure_psf_perturbation,
-                                             plot_psf_perturbation)
-            from pypass.multipass import subtract_stars as _subtract_stars
+            from jwst1pass.diagnostics import (measure_psf_perturbation,
+                                               plot_psf_perturbation)
+            from jwst1pass.multipass import subtract_stars as _subtract_stars
             from scipy.ndimage import spline_filter as _spline_filter_pert
             from astropy.table import Table as _Table
 
@@ -1641,8 +1680,8 @@ def run_psf_fitting(
     output_dir: Path,
     field_name: str,
     lib_dir: Path,
-    telescope: str = 'HST',
-    im_type: str = '_flc',
+    telescope: str = 'JWST',
+    im_type: str = '_cal',
     n_processes: int = -1,
     verbose: bool = True,
     force_refit: bool = False,
@@ -1652,7 +1691,7 @@ def run_psf_fitting(
     restrict_to_obsids: list[str] | None = None,
     psf_dir: Path | None = None,
     parallel: bool = True,
-    # py1pass parameter overrides
+    # jwst1pass / pypass parameter overrides
     fmin: float | None = None,
     fmin_thresh: float | None = None,
     mag_st_max: float | None = None,
@@ -1668,9 +1707,8 @@ def run_psf_fitting(
     Run PSF fitting on all downloaded FLC images for a field.
 
     Each image is processed serially so it has full access to all available
-    cores via py1pass's internal joblib parallelism (n_jobs=n_processes).
-    Cached catalogs are reused when the saved py1pass parameters match the
-    current call.
+    cores via the engine's internal joblib parallelism (n_jobs=n_processes).
+    Cached catalogs are reused when the saved parameters match the current call.
 
     PSF iteration logic (per image):
       - Default: 1 iteration from the bare stdpsf (ignores any stored δP).
@@ -1690,21 +1728,21 @@ def run_psf_fitting(
     output_dir   : pipeline root directory
     field_name   : field subdirectory name
     lib_dir      : directory containing STDPSFs/ and STDGDCs/ subdirectories
-    telescope    : 'HST' (JWST support coming)
-    im_type      : '_flc' or '_flt'
-    n_processes  : cores for py1pass internal parallelism (-1 = all, default)
+    telescope    : 'JWST' or 'HST'
+    im_type      : '_cal' (JWST) or '_flc'/'_flt' (HST)
+    n_processes  : cores for engine internal parallelism (-1 = all, default)
     force_refit      : re-fit even if catalog and matching params already exist
     clean_psf        : ignore stored psf_delta.npy; start from bare stdpsf (overrides apply_psf_delta)
     apply_psf_delta  : load stored psf_delta.npy (if present) as starting PSF model
     n_psf_iter       : explicit number of PSF fitting iterations (overrides default)
-    psf_dir      : unused (pypass is installed as a package); kept for API compatibility
+    psf_dir      : unused (engines are installed as packages); kept for API compatibility
 
     Returns
     -------
     List of output catalog FITS paths
     """
     # psf_dir parameter retained for API compatibility but no longer needed;
-    # pypass is installed as a package.
+    # engines are installed as packages.
 
     if telescope.upper() == 'JWST':
         from .download_jwst import find_flc_images as _find_jwst_cal
@@ -1731,9 +1769,9 @@ def run_psf_fitting(
     print(f"Step 3: PSF fitting ({len(images)} images)")
     print("─"*50)
 
-    # Suppress benign FITS standard-compliance warnings from WFC3/UVIS files and
-    # py1pass catalog writes (long keyword names promoted to HIERARCH cards).
-    # Set as persistent global filters so they are not undone by py1pass's own
+    # Suppress benign FITS standard-compliance warnings from JWST/HST files and
+    # catalog writes (long keyword names promoted to HIERARCH cards).
+    # Set as persistent global filters so they are not undone by the engine's own
     # internal warnings.catch_warnings() contexts.
     warnings.filterwarnings('ignore', message='.*not multiple of 2880.*')
     warnings.filterwarnings('ignore', message='.*greater than 8 characters.*')
@@ -1741,7 +1779,7 @@ def run_psf_fitting(
     # Build parameter dict from defaults + any overrides.
     params = dict(_JWST_DEFAULTS)
     if fmin is not None:
-        # fmin directly sets the pypass flux threshold, overriding both
+        # fmin directly sets the flux threshold, overriding both
         # mag_st_max (set to 99 so fmin_from_mag ≈ 0) and fmin_thresh.
         params['fmin_thresh'] = fmin
         params['mag_st_max']  = 99.0
@@ -1760,7 +1798,7 @@ def run_psf_fitting(
         if val is not None:
             params[key] = val
 
-    # n_processes controls py1pass's internal joblib parallelism for star fitting.
+    # n_processes controls the engine's internal joblib parallelism for star fitting.
     # -1 means "use all available cores" (joblib convention).
     params['n_jobs'] = n_processes
 
@@ -1850,7 +1888,7 @@ def run_psf_fitting(
             _mag_str    = f"--mag_st_max {params['mag_st_max']}"
             _thresh_str = f"--fmin_thresh {params['fmin_thresh']}"
         _cmd = (
-            f"pypass --image <img> --lib_dir {lib_dir}"
+            f"jwst1pass --image <img> --lib_dir {lib_dir}"
             f" --n_passes {params['n_passes']}"
             f" --n_discovery_passes {params['n_discovery_passes']}"
             f" {_mag_str}  {_thresh_str}"
@@ -1863,7 +1901,7 @@ def run_psf_fitting(
             f" --tol {params['tol']}"
             f" --sigma_clip_sigma {params['sigma_clip_sigma']}"
         )
-        print(f"  pypass command (per image):\n    {_cmd}")
+        print(f"  jwst1pass command (per image):\n    {_cmd}")
 
     # ── Iterative PSF refinement ──────────────────────────────────────────────
     # Per-image: load the existing cumulative δP (if any, and if clean_psf is
