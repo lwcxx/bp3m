@@ -206,18 +206,23 @@ Table metadata keys: `SIGMA_FLOOR_X`, `SIGMA_FLOOR_Y`, `EPS_FLUX`, `ZP_AB` (when
 
 ### Cross-matching subpackage (`gaia_cross_match/`)
 
-- `cross_match.py` — `process_single_image()`: 4P offset discovery (2D histogram peak) → 6P affine refinement with per-iteration empirical residual covariance floor → final match
+- `cross_match.py` — HST implementation. `process_single_image()`: 4P offset discovery (2D histogram peak) → 6P affine refinement with per-iteration empirical residual covariance floor → final match. Uses `get_hst_params()` (reads `ORIENTAT`, ACS/WFC3 pixel scales from FLC headers). Outputs `hst_*` columns.
+- `cross_match_jwst.py` — JWST implementation. Same matching algorithm as `cross_match.py`. Key differences:
+  - `get_jwst_params()` — reads `PA_APER` (then `ORIENTAT`, then `PA_V3` as fallback) from the SCI extension; pixel scales from `_JWST_PIXEL_SCALE` dict (NIRCam SW 0.031″, LW 0.063″, NIRISS 0.066″, MIRI 0.111″); `initial_scale=1.0` (no GDC plate-scale correction needed)
+  - `find_hst_image_folders()` (modified) — walks `JWST/`, matches `{name}_cal_catalog.fits` + `*_cal.fits`; returns dicts with `cal` key instead of `flc`
+  - `process_single_image(img, ...)` — takes `img` dict with keys `root`, `catalog`, `cal`; outputs `jwst_*` columns and `is_star` flag
+  - HST-specific dead code removed: `_CHIP_CONFIG`, `get_chip_config`, `get_hst_params`
 - `catalog_matcher.py` — nearest-neighbour matching with magnitude constraint
 - `miracle_match.py` — fallback robust geometric matching via V/VMAX + SNS + progressive sigma tightening
 - `diagnostics.py` — 8-panel per-image diagnostic plots
 
-**Hard catalog column requirements** (cross_match.py raises or skips without these):
+**Hard catalog column requirements** (both cross_match.py and cross_match_jwst.py raise or skip without these):
 
 | Column | Behaviour if missing |
 |--------|---------------------|
 | `is_star_candidate` | Image SKIPPED with WARNING |
 | `x_gdc`, `y_gdc` | Rows dropped if NaN/inf; crash if column absent |
-| `mag_st_gdc` | `ValueError` ("stale py1pass output") |
+| `mag_st_gdc` | `ValueError` ("stale jwst1pass/py1pass output") |
 | `cov_xx_gdc`, `cov_yy_gdc`, `cov_xy_gdc` | Used to build 2×2 positional covariance |
 | `qfit`, `chi2` | Used for 4P discovery quality tiers |
 
@@ -320,9 +325,17 @@ Stars are typed by which Gaia solution they have, checked in `solver.py::_cache_
   - `estimate_systematic_floor` is called on jwst1pass records (uses covariance matrix entries, which jwst1pass computes); `fx/fy/ff` propagated to catalog and `plot_catalog_stats`
   - Image discovery uses `download_jwst.find_flc_images`; `_JWST_DEFAULTS` provides all JWST-specific parameter defaults including `mag_limit=28.0`
 
+- **Step 4 cross-matching (`gaia_cross_match/cross_match_jwst.py`)** — JWST implementation complete (July 2026):
+  - `get_jwst_params(cal_file)` reads `PA_APER`/`ORIENTAT` from SCI ext, pixel scale from `_JWST_PIXEL_SCALE`, `EXPSTART`/`MJD-BEG` from primary header; `initial_scale=1.0`
+  - `find_hst_image_folders()` walks `JWST/` and matches `*_cal_catalog.fits` + `*_cal.fits` (name kept for API compatibility with pipeline's `process_single_image` call)
+  - `process_single_image(img, ...)` — JWST-adapted: `img['cal']` instead of `hst['flc']`; outputs `jwst_index`, `jwst_x_gdc`, `jwst_y_gdc`, `jwst_mag_gdc`, `jwst_mag_st_gdc`, `jwst_mag_ab`, `is_star`
+  - `pipeline/cross_match_jwst.py` still raises `NotImplementedError` for non-HST and imports from `gaia_cross_match.cross_match` (HST) — needs to be updated to import from `gaia_cross_match.cross_match_jwst`
+
 **What is not yet implemented:**
 - `psf_fitting.py` (HST-only) — still raises `NotImplementedError` for non-HST; use `psf_fitting_cal.py` for JWST
-- Step 4 cross-matching — `run_cross_match` uses `_find_image_folders` which looks for `{obsid}_flc_catalog.fits`; JWST catalogs are named `{obsid}_cal_catalog.fits` (via `im_type='_cal'`); verify `_find_image_folders` dispatches correctly for JWST before relying on Step 4
+- `pipeline/cross_match_jwst.py` wiring — still imports from `gaia_cross_match.cross_match` and has `raise NotImplementedError` for non-HST; needs updating to use `gaia_cross_match.cross_match_jwst.process_single_image`
+- `gaia_cross_match/validator.py` — HST-only; walks `HST/`, matches `*_flc.fits`/`*_flc_catalog.fits`, and expects `hst_mag_st_gdc`, `hst_index`, `hst_is_star`, `hst_mag_err_gdc` columns. JWST `matched_gaia.csv` uses `jwst_*` column names and `is_star`. Needs a JWST variant or a `telescope` parameter before `validate_target` can be called after JWST cross-matching.
+- `gaia_cross_match/__init__.py` — exports `process_single_image`, `find_hst_image_folders`, `get_hst_params`, `propagate_gaia_with_cov` only from `cross_match` (HST); nothing is exported from `cross_match_jwst`
 - PSF iteration (`n_psf_iter >= 2`) for JWST — `psf_delta` is not passed into `_fit_one_image_jwst`; `psf_delta.npy` is written for reference only
 
 ### Notebooks
