@@ -145,21 +145,21 @@ def _parse_args():
     psf.add_argument('--fmin', type=float, default=None,
                      help='Directly set the pypass flux detection threshold in electrons. '
                           'Overrides both --mag_st_max and --fmin_thresh when given.')
-    psf.add_argument('--fmin_thresh', type=float, default=None,
+    psf.add_argument('--fmin_thresh', type=float, default=5.0,
                      help='Hard lower bound on the minimum source flux in electrons '
                           '(default 40). Acts as a floor: fmin will never go below '
                           'this value even when mag_st_max would imply a lower threshold. '
                           'Ignored if --fmin is given.')
-    psf.add_argument('--mag_st_max', type=float, default=None,
+    psf.add_argument('--mag_st_max', type=float, default=28.0,
                      help='Faint ST-magnitude limit used to set the detection threshold '
                           '(default 28). Converted to a flux threshold per image using '
                           'PHOTFLAM and EXPTIME; floored at fmin_thresh. '
                           'Ignored if --fmin is given.')
-    psf.add_argument('--hmin', type=int, default=None,
+    psf.add_argument('--hmin', type=int, default=4.0,
                      help='NMS radius in pixels (default 4)')
-    psf.add_argument('--n_passes', type=int, default=None,
+    psf.add_argument('--n_passes', type=int, default=2,
                      help='Total PSF fit passes (default 2)')
-    psf.add_argument('--n_discovery_passes', type=int, default=None,
+    psf.add_argument('--n_discovery_passes', type=int, default=1,
                      help='How many of those passes include new-source detection '
                           '(default: n_passes-1, i.e. last pass is refit-only)')
     psf.add_argument('--psf_max_iter', type=int, default=None,

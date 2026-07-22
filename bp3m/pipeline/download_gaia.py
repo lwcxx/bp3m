@@ -121,9 +121,28 @@ def _mag_bins(min_mag, max_mag, area):
         log10(1.0), log10(1.0 + max_mag - min_mag), num=int(n))
 
 
+_GAIA_QUERY_TIMEOUT = 60    # seconds per attempt (thread-enforced)
+_GAIA_MAX_RETRIES   = 3
+_GAIA_RETRY_BASE    = 10   # seconds; wait doubles each retry
+
+
+def _run_gaia_query(full_q: str):
+    """Execute a single Gaia TAP async query; called inside a timeout thread."""
+    from astroquery.gaia import Gaia
+    job = Gaia.launch_job_async(full_q)
+    result = job.get_results().to_pandas()
+    try:
+        Gaia.remove_jobs([job.jobid])
+    except Exception:
+        pass
+    return result
+
+
 def _query_mag_bin(args):
     """Worker: launch one Gaia TAP query for a magnitude slice."""
-    from astroquery.gaia import Gaia
+    import concurrent.futures
+    import time
+
     query, min_g, max_g, ind_dir, field, n, n_total = args
     full_q = (query +
               f" AND (phot_g_mean_mag > {min_g:.4f})"
@@ -135,12 +154,43 @@ def _query_mag_bin(args):
         if cache_path.exists():
             return pd.read_csv(cache_path)
 
-    job = Gaia.launch_job_async(full_q)
-    result = job.get_results().to_pandas()
-    try:
-        Gaia.remove_jobs([job.jobid])
-    except Exception:
-        pass
+    last_exc: Exception | None = None
+    for attempt in range(_GAIA_MAX_RETRIES):
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = ex.submit(_run_gaia_query, full_q)
+        try:
+            # Hard deadline that fires even when ssl.do_handshake() is stuck.
+            result = future.result(timeout=_GAIA_QUERY_TIMEOUT)
+            ex.shutdown(wait=False)
+            break
+        except KeyboardInterrupt:
+            ex.shutdown(wait=False)
+            raise
+        except concurrent.futures.TimeoutError:
+            # Abandon the stuck thread — do NOT wait for it.
+            ex.shutdown(wait=False)
+            last_exc = TimeoutError(
+                f"Gaia TAP timed out after {_GAIA_QUERY_TIMEOUT}s — "
+                "check connectivity to gea.esac.esa.int"
+            )
+            if attempt < _GAIA_MAX_RETRIES - 1:
+                print(f"  Bin {n}/{n_total}: timed out; "
+                      f"retrying (attempt {attempt + 2}/{_GAIA_MAX_RETRIES}) ...")
+            else:
+                raise last_exc
+        except Exception as exc:
+            ex.shutdown(wait=False)
+            last_exc = exc
+            if attempt < _GAIA_MAX_RETRIES - 1:
+                wait = _GAIA_RETRY_BASE * (2 ** attempt)
+                print(f"  Bin {n}/{n_total}: network error ({exc}); "
+                      f"retrying in {wait}s (attempt {attempt + 2}/{_GAIA_MAX_RETRIES}) ...")
+                time.sleep(wait)
+            else:
+                raise RuntimeError(
+                    f"Gaia TAP query failed after {_GAIA_MAX_RETRIES} attempts "
+                    f"(G {min_g:.2f}–{max_g:.2f})"
+                ) from last_exc
 
     if cache_path is not None:
         result.to_csv(cache_path, index=False)
