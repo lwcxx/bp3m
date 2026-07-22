@@ -460,6 +460,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     field = args.name
+    _im_type = args.jwst_im_type if args.telescope.upper() == 'JWST' else args.hst_im_type
 
     # ── Step 1: Download Gaia ─────────────────────────────────────────────────
     gaia_df = None
@@ -667,12 +668,15 @@ def main():
 
     # ── Step 3: PSF fitting ───────────────────────────────────────────────────
     if not args.skip_psf:
-        from bp3m.pipeline.psf_fitting import run_psf_fitting
+        if args.telescope.upper() == 'JWST':
+            from bp3m.pipeline.psf_fitting_cal import run_psf_fitting
+        else:
+            from bp3m.pipeline.psf_fitting import run_psf_fitting
         run_psf_fitting(
             output_dir=output_dir, field_name=field,
             lib_dir=Path(args.lib_dir),
             telescope=args.telescope,
-            im_type=args.hst_im_type,
+            im_type=_im_type,
             n_processes=args.n_processes,
             verbose=not args.quiet,
             force_refit=args.force_refit_psf,
@@ -688,11 +692,14 @@ def main():
         )
 
     if args.reclassify_stars:
-        from bp3m.pipeline.psf_fitting import reclassify_psf_catalogs
+        if args.telescope.upper() == 'JWST':
+            from bp3m.pipeline.psf_fitting_cal import reclassify_psf_catalogs
+        else:
+            from bp3m.pipeline.psf_fitting import reclassify_psf_catalogs
         reclassify_psf_catalogs(
             output_dir=output_dir, field_name=field,
             telescope=args.telescope,
-            im_type=args.hst_im_type,
+            im_type=_im_type,
             conc_limit=args.conc_limit,
             restrict_to_obsids=_restrict,
             lib_dir=Path(args.lib_dir) if args.lib_dir else None,
@@ -701,23 +708,29 @@ def main():
         )
 
     if args.remeasure_psf_perturbation:
-        from bp3m.pipeline.psf_fitting import remeasure_psf_perturbation
+        if args.telescope.upper() == 'JWST':
+            from bp3m.pipeline.psf_fitting_cal import remeasure_psf_perturbation
+        else:
+            from bp3m.pipeline.psf_fitting import remeasure_psf_perturbation
         remeasure_psf_perturbation(
             output_dir=output_dir, field_name=field,
             lib_dir=Path(args.lib_dir),
             telescope=args.telescope,
-            im_type=args.hst_im_type,
+            im_type=_im_type,
             restrict_to_obsids=_restrict,
             verbose=not args.quiet,
         )
 
     # ── Step 4: Cross-matching ────────────────────────────────────────────────
     if not args.skip_crossmatch:
-        from bp3m.pipeline.cross_match import run_cross_match
+        if args.telescope.upper() == 'JWST':
+            from bp3m.pipeline.cross_match_jwst import run_cross_match
+        else:
+            from bp3m.pipeline.cross_match import run_cross_match
         run_cross_match(
             output_dir=output_dir, field_name=field,
             telescope=args.telescope,
-            im_type=args.hst_im_type,
+            im_type=_im_type,
             n_processes=args.n_processes,
             hst_pix_floor=args.cross_match_pix_floor,
             min_matches=args.min_matches,
@@ -730,9 +743,15 @@ def main():
         )
 
     # ── Step 5a: Synthetic data generation (optional) ─────────────────────────
+    _is_jwst = args.telescope.upper() == 'JWST'
+    _split_ccd_syn      = False if _is_jwst else not args.no_split_ccd
+    _inflate_errors_syn = False if _is_jwst else not args.no_inflate_hst_errors
 
     if args.test_synthetic:
-        from bp3m.pipeline.synthetic import generate_synthetic_data, compare_synthetic_results
+        if args.telescope.upper() == 'JWST':
+            from bp3m.pipeline.synthetic_jwst import generate_synthetic_data, compare_synthetic_results
+        else:
+            from bp3m.pipeline.synthetic import generate_synthetic_data, compare_synthetic_results
 
         # Build a unique subdirectory name so different configurations don't
         # overwrite each other (e.g. 'synthetic_only5p_seed43').
@@ -761,7 +780,7 @@ def main():
             output_dir=output_dir,
             field_name=field,
             telescope=args.telescope,
-            im_type=args.hst_im_type,
+            im_type=_im_type,
             draw_from_prior=args.synthetic_draw_from_prior,
             zero_parallax=args.synthetic_zero_parallax,
             true_gaia=args.synthetic_true_gaia,
@@ -779,7 +798,10 @@ def main():
 
     # ── Step 5: Bayesian alignment ────────────────────────────────────────────
     if not args.skip_alignment:
-        from bp3m.pipeline.run_alignment import run_alignment
+        if args.telescope.upper() == 'JWST':
+            from bp3m.pipeline.run_alignment_jwst import run_alignment
+        else:
+            from bp3m.pipeline.run_alignment import run_alignment
 
         if args.test_synthetic:
             # Run BP3M on the synthetic directory tree.
@@ -796,9 +818,9 @@ def main():
                 mcmc_posteriors=args.mcmc_posteriors,
                 clip_sigma=args.bp3m_clip_sigma,
                 poly_order=args.poly_order,
-                split_ccd=not args.no_split_ccd,
+                split_ccd=_split_ccd_syn,
                 min_stars_split_ccd=args.min_stars_split_ccd,
-                inflate_hst_errors=not args.no_inflate_hst_errors,
+                inflate_hst_errors=_inflate_errors_syn,
                 use_sparse=args.sparse,
                 no_plots=args.no_plots,
                 images=_bp3m_images,
@@ -819,7 +841,10 @@ def main():
             print("\n" + "=" * 55)
             print("Synthetic test — comparing results to truth")
             print("=" * 55)
-            from bp3m.pipeline.synthetic import compare_synthetic_results, run_conditional_solve
+            if args.telescope.upper() == 'JWST':
+                from bp3m.pipeline.synthetic_jwst import compare_synthetic_results, run_conditional_solve
+            else:
+                from bp3m.pipeline.synthetic import compare_synthetic_results, run_conditional_solve
             compare_synthetic_results(
                 output_dir=output_dir,
                 field_name=field,
@@ -833,10 +858,10 @@ def main():
                 output_dir=output_dir,
                 field_name=field,
                 syn_name=syn_name,
-                split_ccd=not args.no_split_ccd,
+                split_ccd=_split_ccd_syn,
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 poly_order=args.poly_order,
-                inflate_hst_errors=not args.no_inflate_hst_errors,
+                inflate_hst_errors=_inflate_errors_syn,
             )
         else:
             run_alignment(
@@ -846,9 +871,9 @@ def main():
                 mcmc_posteriors=args.mcmc_posteriors,
                 clip_sigma=args.bp3m_clip_sigma,
                 poly_order=args.poly_order,
-                split_ccd=not args.no_split_ccd,
+                split_ccd=False if _is_jwst else not args.no_split_ccd,
                 min_stars_split_ccd=args.min_stars_split_ccd,
-                inflate_hst_errors=not args.no_inflate_hst_errors,
+                inflate_hst_errors=False if _is_jwst else not args.no_inflate_hst_errors,
                 use_sparse=args.sparse,
                 no_plots=args.no_plots,
                 images=_bp3m_images,

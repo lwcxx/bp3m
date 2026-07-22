@@ -26,28 +26,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import pandas as pd
 
 
-def _find_image_folders(output_dir: Path, field_name: str,
-                         telescope: str = 'HST', im_type: str = '_flc') -> list[dict]:
-    """
-    Return list of dicts with keys {root, catalog, flc} for each image that
-    has both an FLC FITS file and a matching _catalog.fits.
-    """
-    root = (Path(output_dir) / field_name / telescope.upper()
-            / "mastDownload" / telescope.upper())
-    folders = []
-    if not root.exists():
-        return folders
-    for obs_dir in sorted(root.iterdir()):
-        if not obs_dir.is_dir():
-            continue
-        name   = obs_dir.name
-        suffix = f"{im_type}.fits"
-        flc    = obs_dir / f"{name}{suffix}"
-        cat    = obs_dir / f"{name}{suffix.replace('.fits', '_catalog.fits')}"
-        if flc.exists() and cat.exists():
-            folders.append({'root': str(obs_dir), 'catalog': str(cat), 'flc': str(flc)})
-    return folders
-
 
 def _write_xmatch_status(root: Path, status: str, params_meta: dict,
                           reason: str = '', n_matched: int = 0) -> None:
@@ -119,7 +97,7 @@ def _has_mag_calibration(catalog_path: Path) -> bool:
 def _match_one(args):
     """Worker: cross-match one image. Returns (image_name, n_matched, error)."""
     hst_dict, gaia_df, kwargs = args
-    from gaia_cross_match.cross_match import process_single_image
+    from gaia_cross_match.cross_match_jwst import process_single_image
 
     root        = Path(hst_dict['root'])
     name        = root.name
@@ -162,8 +140,8 @@ def _match_one(args):
 def run_cross_match(
     output_dir: Path,
     field_name: str,
-    telescope: str = 'HST',
-    im_type: str = '_flc',
+    telescope: str = 'JWST',
+    im_type: str = '_cal',
     n_processes: int = 4,
     hst_pix_floor: float = 0.05,
     min_matches: int = 3,
@@ -204,16 +182,10 @@ def run_cross_match(
     -------
     List of matched_gaia.csv paths
     """
-    if telescope.upper() != 'HST':
-        raise NotImplementedError(
-            "Cross-matching for non-HST telescopes is not yet implemented. "
-            "JWST support is planned once gaia_cross_match handles JWST headers."
-        )
-
-    from gaia_cross_match.cross_match import load_gaia_data
+    from gaia_cross_match.cross_match_jwst import load_gaia_data
 
     print("\n" + "─"*50)
-    print("Step 4: Cross-matching HST ↔ Gaia")
+    print("Step 4: Cross-matching JWST ↔ Gaia")
     print("─"*50)
 
     gaia_df = load_gaia_data(field_name, str(Path(output_dir)))
@@ -221,8 +193,8 @@ def run_cross_match(
         print("  ERROR: could not load Gaia catalogue.")
         return []
 
-    folders = _find_image_folders(output_dir, field_name,
-                                   telescope=telescope, im_type=im_type)
+    from gaia_cross_match.cross_match_jwst import find_hst_image_folders as find_jwst_image_folders
+    folders = find_jwst_image_folders(field_name, str(Path(output_dir)))
     if image_id:
         folders = [f for f in folders if Path(f['root']).name == image_id]
 
@@ -264,7 +236,7 @@ def run_cross_match(
         # NaN so they cannot contribute to magnitude-based cross-matching.
         if not _has_mag_calibration(Path(hst['catalog'])):
             _write_xmatch_status(root, 'skipped', params_meta,
-                                  reason='no photometric calibration (PHOTFLAM/EXPTIME missing)')
+                                  reason='no photometric calibration (PIXAR_SR missing or mag all-NaN)')
             skipped_nophot.append(name)
             continue
 
@@ -282,7 +254,7 @@ def run_cross_match(
     if skipped:
         print(f"  {len(skipped)} image(s) already matched — skipping.")
     if skipped_nophot:
-        print(f"  {len(skipped_nophot)} image(s) skipped — no photometric calibration (PHOTFLAM missing): "
+        print(f"  {len(skipped_nophot)} image(s) skipped — no photometric calibration (PIXAR_SR missing): "
               f"{', '.join(skipped_nophot)}")
     if not work:
         print("  All cross-matches up to date.")
@@ -329,7 +301,7 @@ def run_cross_match(
 
     # Run cross-image validation
     try:
-        from gaia_cross_match.validator import validate_target
+        from gaia_cross_match.validator_jwst import validate_target
         print("\n  Running cross-image validation...")
         validate_target(field_name, str(Path(output_dir)))
     except Exception as _e:
