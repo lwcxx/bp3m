@@ -35,7 +35,7 @@ def run_alignment(  # noqa: C901
     split_ccd: bool = False,
     min_stars_split_ccd: int = 20,
     use_sparse: bool = False,
-    inflate_hst_errors: bool = False,
+    inflate_hst_errors: bool = True,
     no_prefilter: bool = False,
     no_plots: bool = False,
     images: list[str] | None = None,

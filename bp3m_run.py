@@ -745,7 +745,7 @@ def main():
     # ── Step 5a: Synthetic data generation (optional) ─────────────────────────
     _is_jwst = args.telescope.upper() == 'JWST'
     _split_ccd_syn      = False if _is_jwst else not args.no_split_ccd
-    _inflate_errors_syn = False if _is_jwst else not args.no_inflate_hst_errors
+    _inflate_errors_syn = not args.no_inflate_hst_errors
 
     if args.test_synthetic:
         if args.telescope.upper() == 'JWST':
@@ -873,7 +873,7 @@ def main():
                 poly_order=args.poly_order,
                 split_ccd=False if _is_jwst else not args.no_split_ccd,
                 min_stars_split_ccd=args.min_stars_split_ccd,
-                inflate_hst_errors=False if _is_jwst else not args.no_inflate_hst_errors,
+                inflate_hst_errors=not args.no_inflate_hst_errors,
                 use_sparse=args.sparse,
                 no_plots=args.no_plots,
                 images=_bp3m_images,

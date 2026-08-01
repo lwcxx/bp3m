@@ -55,13 +55,22 @@ The repo is a single Python package (`bp3m`) plus two bundled subpackages (`pypa
 
 Steps can be individually skipped with `--skip_download`, `--skip_psf`, `--skip_crossmatch`, `--skip_alignment`. An obsid manifest (`{field}_selected_obsids.json`) persists image selection across runs.
 
+**Gaia TAP timeout behaviour** (`download_gaia.py:124-193`): each magnitude-bin query runs in a worker thread under a hard `_GAIA_QUERY_TIMEOUT = 60`s deadline (`future.result(timeout=...)`), retried up to `_GAIA_MAX_RETRIES = 3` times before raising:
+```
+TimeoutError: Gaia TAP timed out after 60s — check connectivity to gea.esac.esa.int
+```
+Observed in practice: the TAP job can actually finish server-side (visible as `INFO: Query finished.` / `INFO: Removed jobs: [...]` in the astroquery log) *after* the local 60s deadline has already fired and the thread was abandoned — i.e. this isn't necessarily "archive unreachable," it can just be "round-trip took longer than 60s" (slow network path, VPN, or the archive under load). Options if this happens:
+1. Just retry — a later run may finish within the deadline if it was transient congestion.
+2. Raise `_GAIA_QUERY_TIMEOUT` in `download_gaia.py` if this happens consistently on a given network.
+3. Narrow the query (`--search_radius`, `--min_gmag`/`--max_gmag`) so each TAP job returns faster.
+
 ### Telescope dispatch
 
 Step 2 dispatches on `--telescope`:
 - `HST` (default) → `download_hst_images()` using `--hst_im_type` (default `_flc`)
 - `JWST` → `download_jwst_images()` using `--jwst_im_type` (default `_cal`); supports NIRCam, NIRISS, MIRI
 
-All steps dispatch on `--telescope HST|JWST` via if/else in `bp3m_run.py`. HST uses `_flc` images; JWST uses `_cal` images. `split_ccd` and `inflate_hst_errors` default to `False` for JWST throughout.
+All steps dispatch on `--telescope HST|JWST` via if/else in `bp3m_run.py`. HST uses `_flc` images; JWST uses `_cal` images. `split_ccd` defaults to `False` for JWST throughout (ACS/WFC-chip-specific, not applicable to JWST detectors). `inflate_hst_errors` (per-image empirical covariance inflation; the "hst" in the name is legacy — it operates on generic per-image position covariance) now defaults to `True` for JWST as well, same as HST, controlled by `--no_inflate_hst_errors`.
 
 **JWST PSF fitting**: `psf_fitting_cal.py` is the JWST entry point. `run_psf_fitting(telescope='JWST')` now calls `jwst1pass_py_v2` and produces pypass-schema catalogs; the `NotImplementedError` guard has been removed.
 
@@ -69,7 +78,7 @@ All steps dispatch on `--telescope HST|JWST` via if/else in `bp3m_run.py`. HST u
 
 - `pipeline/psf_fitting_cal.py` — JWST-only CAL entry point (HST uses `psf_fitting.py`). `run_psf_fitting` calls `_fit_one_image`, which is a thin wrapper around `_fit_one_image_jwst`. `_fit_one_image_jwst` computes `zero_point` per-image from `PIXAR_SR` (`ZP_AB = -2.5 * log10(PIXAR_SR × 1e6 / 3631)`), then calls `jwst1pass_py_v2.jwst1pass.io.run_photometry_fits` and writes a pypass-schema catalog via `_build_jwst_catalog_table`. Key helpers: `_ensure_jwst1pass()` — sys.path injection for jwst1pass_py_v2; `_build_jwst_catalog_table()` — column adapter (renames `q→qfit`, adds `mag_st_gdc`, `is_star_candidate`, `chip_ext`, `eps_psf`, `sigma_*_model`, floor metadata). `_JWST_DEFAULTS` are tuned for JWST CAL: `fmin_thresh=5.0`, `hmin=5`, `half_width=5`, `mag_limit=28.0` (vs. `psf_fitting.py`'s `_HST_DEFAULTS`: `fmin_thresh=100.0`, `hmin=4`, `half_width=3` for HST FLC).
 - `pipeline/hst_catalog_crossmatch.py` — Cross-match ALL HST sources between images (not just Gaia-matched ones). Three-phase: (1) within-filter, (2) cross-filter, (3) Gaia recovery. Outputs go to `hst_xmatch/`. Used by the v2 pipeline to build the master catalog for BP3M v2.
-- `pipeline/run_alignment_jwst.py` — JWST equivalent of `run_alignment.py`. Uses `data_loader_cal.load_image_data_flc`; defaults `split_ccd=False`, `inflate_hst_errors=False`. Otherwise identical solver flow to `run_alignment.py`.
+- `pipeline/run_alignment_jwst.py` — JWST equivalent of `run_alignment.py`. Uses `data_loader_cal.load_image_data_flc`; defaults `split_ccd=False`, `inflate_hst_errors=True` (matches `run_alignment.py`). Otherwise identical solver flow to `run_alignment.py`.
 - `pipeline/run_alignment_v2.py` — BP3M v2 alignment using `master_combined_v2.csv`. Adds HST-only sources (no Gaia prior) with a phased-inclusion callback (`V2AlignmentCallback`) that enables them after iteration `hst_enable_iter`. Writes to `BP3M_v2_results/`.
 - `pipeline/run_iterate_v2.py` — Entry point for `bp3m-v2`. Orchestrates: (1) initial master cross-match → (2) BP3M v2 alignment → (3) updated master cross-match; repeated `--n_refine` times.
 - `pipeline/data_loader_master.py` — Loads `master_combined_v2.csv` for BP3M v2. HST-only sources get synthetic negative Gaia IDs, flat position priors, and Michalik+100 mas/yr PM prior (treated as `gaia_2p`).
@@ -77,7 +86,7 @@ All steps dispatch on `--telescope HST|JWST` via if/else in `bp3m_run.py`. HST u
 - `pipeline/explore_utils.py` — `load_gaia_catalog()`, `load_bp3m_results()` and other notebook helpers.
 - `pipeline/output.py` — `print_field_summary()`, `write_ds9_region_file()`.
 - `pipeline/synthetic.py` — Generates synthetic HST observations from real cross-match data; `compare_synthetic_results()` and `run_conditional_solve()` check recovered vs. truth PMs.
-- `pipeline/synthetic_jwst.py` — JWST equivalent of `synthetic.py`. Key differences: uses `jwst_index` (not `hst_index`), `data_loader_cal` (not `data_loader_flc`), `_mjd_from_cal` with `MJD-BEG`/`MJD-END` fallback, `split_ccd=False`, `inflate_hst_errors=False`.
+- `pipeline/synthetic_jwst.py` — JWST equivalent of `synthetic.py`. Key differences: uses `jwst_index` (not `hst_index`), `data_loader_cal` (not `data_loader_flc`), `_mjd_from_cal` with `MJD-BEG`/`MJD-END` fallback, `split_ccd=False`. `inflate_hst_errors` defaults to `True`, matching `synthetic.py`.
 - `bp3m/data_loader_cal.py` — JWST data loader (parallel to `data_loader_flc.py` for HST). Reads `{img}_cal.fits` (with `EXPSTART`/`MJD-BEG` fallback), `{img}_cal_catalog.fits`, `matched_gaia.csv` (uses `jwst_index`), and `transformation.csv`. Directory root: `JWST/mastDownload/JWST/`. Public entry point: `load_image_data_flc(data_root, field_name)` — returns the same `(images, stars_per_image, gaia_catalog)` triple as the HST loader.
 - `bp3m/checkpointing.py` — Save/restore solver inputs and posterior arrays. Layout: `metadata.json`, `gaia_catalog.csv`, `hst_sources/<img>.csv`, `results/{r_hat,C_r,v_hat,v_mean,v_cov,...}.npy`.
 
@@ -348,7 +357,7 @@ Stars are typed by which Gaia solution they have, checked in `solver.py::_cache_
   - `_im_type` resolved once at start of `main()`: `args.jwst_im_type` for JWST, `args.hst_im_type` for HST; used in Steps 3, 4, and synthetic test
   - Step 3: dispatches to `psf_fitting_cal.run_psf_fitting` for JWST, `psf_fitting.run_psf_fitting` for HST; `reclassify_psf_catalogs` and `remeasure_psf_perturbation` also dispatched
   - Step 4: dispatches to `cross_match_jwst.run_cross_match` for JWST, `cross_match.run_cross_match` for HST
-  - Step 5: dispatches to `run_alignment_jwst.run_alignment` for JWST, `run_alignment.run_alignment` for HST; `split_ccd` and `inflate_hst_errors` forced to `False` for JWST in all call sites
+  - Step 5: dispatches to `run_alignment_jwst.run_alignment` for JWST, `run_alignment.run_alignment` for HST; `split_ccd` forced to `False` for JWST in all call sites (`inflate_hst_errors` follows `--no_inflate_hst_errors` for both telescopes as of 2026-08-01)
   - Step 5a: dispatches to `synthetic_jwst` for JWST, `synthetic` for HST; `_split_ccd_syn` and `_inflate_errors_syn` computed once and reused across synthetic sub-steps
   - Steps 2 and manifest scanning already had telescope if/else before this session
 

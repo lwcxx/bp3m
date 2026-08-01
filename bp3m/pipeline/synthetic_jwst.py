@@ -887,7 +887,7 @@ def run_conditional_solve(
     split_ccd: bool = False,
     min_stars_split_ccd: int = 20,
     poly_order: int = 1,
-    inflate_hst_errors: bool = False,
+    inflate_hst_errors: bool = True,
     bp3m_dir: Path | None = None,
 ) -> pd.DataFrame:
     """
