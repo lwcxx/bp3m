@@ -53,11 +53,23 @@ def find_hst_image_folders(target, data_dir):
     return folders
 
 
+# Nominal pixel scales (arcsec/px), refined by per-detector empirical
+# ratios measured against WCS CD-matrix scales (see bp3m/CLAUDE.md).
 _JWST_PIXEL_SCALE = {
-    'NIRCAM_SW': 0.031,
-    'NIRCAM_LW': 0.063,
-    'NIRISS':    0.066,
-    'MIRI':      0.111,
+    'NRCA1':     0.031087,
+    'NRCA2':     0.031050,
+    'NRCA3':     0.031086,
+    'NRCA4':     0.031044,
+    'NRCB1':     0.031048,
+    'NRCB2':     0.031091,
+    'NRCB3':     0.031046,
+    'NRCB4':     0.031088,
+    'NRCALONG':  0.063151,
+    'NRCBLONG':  0.063146,
+    'NIRCAM_SW': 0.031,   # fallback: unrecognised SW detector
+    'NIRCAM_LW': 0.063,   # fallback: unrecognised LW detector
+    'NIRISS':    0.066238,
+    'MIRI':      0.110979,
 }
 
 
@@ -88,7 +100,9 @@ def get_jwst_params(cal_file):
                   hdr0.get('PA_V3', 0.0)))
 
         if instrume == 'NIRCAM':
-            if any(s in detector for s in ('LONG', 'AL')):
+            if detector in _JWST_PIXEL_SCALE:
+                pixel_scale = _JWST_PIXEL_SCALE[detector]
+            elif any(s in detector for s in ('LONG', 'AL')):
                 pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_LW']
             else:
                 pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
