@@ -40,16 +40,19 @@ def load_gaia_data(target, data_dir):
     if 'bp_rp' in df.columns: mask &= np.isfinite(df['bp_rp'])
     return df[mask]
 
-def find_hst_image_folders(target, data_dir):
-    hst_root = os.path.join(data_dir, target, "HST")
+def find_hst_image_folders(target, data_dir, telescope='HST'):
+    if telescope == 'JWST':
+        image_root, suffix, key = os.path.join(data_dir, target, "JWST"), "_cal", "cal"
+    else:
+        image_root, suffix, key = os.path.join(data_dir, target, "HST"), "_flc", "flc"
     folders = []
-    for root, dirs, files in os.walk(hst_root):
+    for root, dirs, files in os.walk(image_root):
         image_name = root.split('/')[-1]
-        cat_fname = f"{image_name}_flc_catalog.fits"
+        cat_fname = f"{image_name}{suffix}_catalog.fits"
         if cat_fname in files:
-            flc_files = glob.glob(os.path.join(root, "*_flc.fits"))
-            if flc_files:
-                folders.append({"root": root, "catalog": os.path.join(root, cat_fname), "flc": flc_files[0]})
+            image_files = glob.glob(os.path.join(root, f"*{suffix}.fits"))
+            if image_files:
+                folders.append({"root": root, "catalog": os.path.join(root, cat_fname), key: image_files[0]})
     return folders
 
 # Science and DQ extension pairs, and PSF-grid y-offsets, per chip
@@ -84,7 +87,104 @@ def get_chip_config(instrume, detector):
     return config
 
 
-def get_hst_params(flc_file, catalog_file=None):
+# Nominal JWST pixel scales (arcsec/px) by instrument/channel group.
+_JWST_PIXEL_SCALE = {
+    'NIRCAM_SW': 0.031,
+    'NIRCAM_LW': 0.063,
+    'NIRISS':    0.066,
+    'MIRI':      0.111,
+}
+
+
+def get_hst_params(flc_file, catalog_file=None, telescope='HST'):
+    if telescope == 'JWST':
+        with fits.open(flc_file) as hdul:
+            hdr0     = hdul[0].header
+            instrume = hdr0.get('INSTRUME', '').upper()
+            detector = hdr0.get('DETECTOR', '').upper()
+
+            sci_hdr = hdul['SCI'].header
+            naxis1  = sci_hdr.get('NAXIS1', 2048)
+            naxis2  = sci_hdr.get('NAXIS2', 2048)
+            ra_cen  = sci_hdr.get('CRVAL1', 0.0)
+            dec_cen = sci_hdr.get('CRVAL2', 0.0)
+            x_cen   = sci_hdr.get('CRPIX1', naxis1 / 2.0)
+            y_cen   = sci_hdr.get('CRPIX2', naxis2 / 2.0)
+
+            # PA_APER: position angle of the aperture y-axis East of North.
+            # ORIENTAT is equivalent and lives in the same SCI extension.
+            # Falls back to PA_V3 (telescope roll, approximate) as last resort.
+            pa_aper = sci_hdr.get('PA_APER',
+                      sci_hdr.get('ORIENTAT',
+                      hdr0.get('PA_V3', 0.0)))
+
+            # initial_scale = measured detector pixel scale / nominal group pixel
+            # scale above, so pixel_scale * initial_scale reproduces the WCS-measured
+            # value (see bp3m/CLAUDE.md for the per-detector measurements).
+            if instrume == 'NIRCAM' and detector == 'NRCA1':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+                initial_scale = 1.0073
+            elif instrume == 'NIRCAM' and detector == 'NRCA2':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+                initial_scale = 0.9928
+            elif instrume == 'NIRCAM' and detector == 'NRCA3':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+                initial_scale = 1.0110
+            elif instrume == 'NIRCAM' and detector == 'NRCA4':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+                initial_scale = 0.9968
+            elif instrume == 'NIRCAM' and detector == 'NRCALONG':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_LW']
+                initial_scale = 0.9985
+            elif instrume == 'NIRCAM' and detector == 'NRCB1':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+                initial_scale = 0.9918
+            elif instrume == 'NIRCAM' and detector == 'NRCB2':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+                initial_scale = 1.0063
+            elif instrume == 'NIRCAM' and detector == 'NRCB3':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+                initial_scale = 0.9959
+            elif instrume == 'NIRCAM' and detector == 'NRCB4':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+                initial_scale = 1.0105
+            elif instrume == 'NIRCAM' and detector == 'NRCBLONG':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_LW']
+                initial_scale = 1.0
+            elif instrume == 'NIRCAM':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_LW'] if any(s in detector for s in ('LONG', 'AL')) \
+                              else _JWST_PIXEL_SCALE['NIRCAM_SW']
+                initial_scale = 1.0
+            elif instrume == 'NIRISS':
+                pixel_scale = _JWST_PIXEL_SCALE['NIRISS']
+                initial_scale = 0.9934
+            elif instrume == 'MIRI':
+                pixel_scale = _JWST_PIXEL_SCALE['MIRI']
+                initial_scale = 0.9992
+            else:
+                pixel_scale = 0.066
+                initial_scale = 1.0
+
+            exp_start = hdr0.get('EXPSTART', hdr0.get('MJD-BEG', 51544.0))
+            exp_end   = hdr0.get('EXPEND',   hdr0.get('MJD-END', exp_start))
+            expstart  = 0.5 * (exp_start + exp_end)
+
+        return {
+            'ra_cen':        ra_cen,
+            'dec_cen':       dec_cen,
+            'x_cen':         x_cen,
+            'y_cen':         y_cen,
+            'pixel_scale':   pixel_scale,
+            'initial_scale': initial_scale,
+            'obs_epoch_mjd': expstart,
+            'orientat':      pa_aper,
+            'naxis1':        naxis1,
+            'naxis2':        naxis2,
+            'instrument':    instrume,
+            'detector':      detector,
+            'chip_dims':     {1: (naxis1, naxis2)},
+        }
+
     with fits.open(flc_file) as hdul:
         header0 = hdul[0].header
         instrument, detector = header0.get('INSTRUME', ''), header0.get('DETECTOR', '')
@@ -244,22 +344,27 @@ def project_gaia_cov_to_pixel(Ct, ra, dec, params):
     C_pix = np.einsum('nij,njk,nlk->nil', J_proj, Ct, J_proj)
     return C_pix
 
-def save_diagnostic_plots(out_dir, image_name, matched_df, rejected_df):
+def save_diagnostic_plots(out_dir, image_name, matched_df, rejected_df, telescope='HST'):
     """Generates diagnostic plots.
 
     Colour scheme:
-      blue   — matched star candidates (hst_is_star == True)
-      orange — matched non-star sources (hst_is_star == False)
+      blue   — matched star candidates (star_col == True)
+      orange — matched non-star sources (star_col == False)
       red    — rejected / unmatched
     """
+    if telescope == 'JWST':
+        star_col, color_col = 'is_star', 'color_jwst'
+    else:
+        star_col, color_col = 'hst_is_star', 'color_hst'
+
     fig, axes = plt.subplots(5, 2, figsize=(14, 24/4*5))
     fig.suptitle(f"Match Diagnostics: {image_name}", fontsize=18)
     all_df = pd.concat([matched_df, rejected_df])
 
-    has_star_col = 'hst_is_star' in matched_df.columns
+    has_star_col = star_col in matched_df.columns
     if has_star_col:
-        m_stars  = matched_df[matched_df['hst_is_star'].astype(bool)]
-        m_nonstars = matched_df[~matched_df['hst_is_star'].astype(bool)]
+        m_stars    = matched_df[matched_df[star_col].astype(bool)]
+        m_nonstars = matched_df[~matched_df[star_col].astype(bool)]
     else:
         m_stars, m_nonstars = matched_df, matched_df.iloc[0:0]
 
@@ -298,12 +403,12 @@ def save_diagnostic_plots(out_dir, image_name, matched_df, rejected_df):
     else:
         ax.text(0.5, 0.5, "BP-RP not available", ha='center', va='center'); ax.set_title("CMD Placeholder")
 
-    # 3. Gaia vs HST CMD (G vs G-HST_mag)
+    # 3. Gaia vs survey CMD (G vs G-survey_mag)
     ax = axes[1, 1]
     if len(rejected_df) > 0:
-        ax.scatter(rejected_df['color_hst'], rejected_df['mag'], c='red', alpha=0.15, s=5, label='Rejected')
-    _scatter_matched(ax, 'color_hst', 'mag')
-    ax.invert_yaxis(); ax.set_xlabel("Gaia G - HST (mag)"); ax.set_ylabel("Gaia G (mag)"); ax.set_title("Gaia G - HST Color-Magnitude"); ax.legend(fontsize=7)
+        ax.scatter(rejected_df[color_col], rejected_df['mag'], c='red', alpha=0.15, s=5, label='Rejected')
+    _scatter_matched(ax, color_col, 'mag')
+    ax.invert_yaxis(); ax.set_xlabel(f"Gaia G - {telescope} (mag)"); ax.set_ylabel("Gaia G (mag)"); ax.set_title(f"Gaia G - {telescope} Color-Magnitude"); ax.legend(fontsize=7)
 
     # 4. XY Residual Scatter
     ax = axes[2, 0]
@@ -377,9 +482,9 @@ def save_diagnostic_plots(out_dir, image_name, matched_df, rejected_df):
     ax = axes[4, 1]
     if 'color' in matched_df.columns:
         if len(rejected_df) > 0:
-            ax.scatter(rejected_df['color'], rejected_df['color_hst'], c='red', alpha=0.15, s=5, label='Rejected')
-        _scatter_matched(ax, 'color', 'color_hst')
-        ax.invert_yaxis(); ax.set_xlabel("BP - RP (mag)"); ax.set_ylabel("G - HST (mag)"); ax.set_title("Color-Color Diagram"); ax.legend(fontsize=7)
+            ax.scatter(rejected_df['color'], rejected_df[color_col], c='red', alpha=0.15, s=5, label='Rejected')
+        _scatter_matched(ax, 'color', color_col)
+        ax.invert_yaxis(); ax.set_xlabel("BP - RP (mag)"); ax.set_ylabel(f"G - {telescope} (mag)"); ax.set_title("Color-Color Diagram"); ax.legend(fontsize=7)
     else:
         ax.text(0.5, 0.5, "BP-RP not available", ha='center', va='center'); ax.set_title("CMD Placeholder")
 
@@ -401,7 +506,7 @@ class FileLogger(object):
 # Discovery and refinement helpers
 # ---------------------------------------------------------------------------
 
-def _plot_offset_histogram(hist, xed, yed, peaks, title, filepath):
+def _plot_offset_histogram(hist, xed, yed, peaks, title, filepath, telescope='HST'):
     fig, ax = plt.subplots(figsize=(6, 5))
     with np.errstate(divide='ignore', invalid='ignore'):
         # log_hist = np.log10(hist.T + 1e-30)
@@ -416,22 +521,22 @@ def _plot_offset_histogram(hist, xed, yed, peaks, title, filepath):
     for dx, dy, _ in peaks:
         ax.axvline(dx, color='red', lw=0.8, ls='--', alpha=0.7)
         ax.axhline(dy, color='red', lw=0.8, ls='--', alpha=0.7)
-    ax.set_xlabel('dx  (HST − Gaia guess, pixels)')
-    ax.set_ylabel('dy  (HST − Gaia guess, pixels)')
+    ax.set_xlabel(f'dx  ({telescope} − Gaia guess, pixels)')
+    ax.set_ylabel(f'dy  ({telescope} − Gaia guess, pixels)')
     ax.set_title(title)
     fig.tight_layout()
     fig.savefig(filepath, dpi=120)
     plt.close(fig)
 
 
-def _save_offset_histogram(best, image_name, out_dir):
+def _save_offset_histogram(best, image_name, out_dir, telescope='HST'):
     if best.get('offset_hist') is None:
         return
     ds_str = f"ds={best.get('best_ds', 0.0):+.4f}"
     title = f'{image_name}  |  best tier q<{best["q"]} m<{best["m"]:.1f}  {ds_str}'
     _plot_offset_histogram(best['offset_hist'], best['offset_xed'], best['offset_yed'],
                            best.get('offset_peaks', []), title,
-                           os.path.join(out_dir, 'offset_histogram.png'))
+                           os.path.join(out_dir, 'offset_histogram.png'), telescope=telescope)
 
 
 def _run_4p_discovery(hst_d, gaia_f, params, max_mag_diff, scale_sweep=False, discovery_max_offset=50):
@@ -699,21 +804,25 @@ def _run_affine_refinement(best_4p, hst_d, gaia_f, tree_gaia, max_mag_diff, use_
 # Main per-image processor
 # ---------------------------------------------------------------------------
 
-def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True):
+def process_single_image(img, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_pm=False, max_mag_diff=3.0, scale_sweep=False, discovery_max_offset=50, use_resid_floor=True, telescope='HST'):
     start_time = time.time()
-    image_name = os.path.basename(hst['flc']).replace("_flc.fits", "")
-    log_file, original_stdout = os.path.join(hst['root'], "processing_log.txt"), sys.stdout
+    if telescope == 'JWST':
+        image_key, image_suffix = 'cal', '_cal.fits'
+    else:
+        image_key, image_suffix = 'flc', '_flc.fits'
+    image_name = os.path.basename(img[image_key]).replace(image_suffix, "")
+    log_file, original_stdout = os.path.join(img['root'], "processing_log.txt"), sys.stdout
     sys.stdout = FileLogger(log_file)
     print(f"Starting {image_name}...", file=original_stdout)
     try:
-        print(f"--- Processing HST image: {image_name} ---")
-        params = get_hst_params(hst['flc'], catalog_file=hst['catalog'])
+        print(f"--- Processing {telescope} image: {image_name} ---")
+        params = get_hst_params(img[image_key], catalog_file=img['catalog'], telescope=telescope)
         if params is None:
             print(f"Finished {image_name}: Failed to load parameters.", file=original_stdout)
             return
         params['min_matches'] = min_matches
 
-        # --- Propagate Gaia to HST epoch and project to pixel frame ---
+        # --- Propagate Gaia to the observation epoch and project to pixel frame ---
         ra_prop, dec_prop, Ct = propagate_gaia_with_cov(gaia_df, params['obs_epoch_mjd'], zero_pm=zero_pm)
         dx_deg_full = rd2x(ra_prop, dec_prop, params['ra_cen'], params['dec_cen'])
         dy_deg_full = rd2y(ra_prop, dec_prop, params['ra_cen'], params['dec_cen'])
@@ -727,7 +836,8 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         x_gaia_proj = params['x_cen'] - dx_deg_full / scale_deg
         y_gaia_proj = params['y_cen'] + dy_deg_full / scale_deg
 
-        # Rotate Gaia positions into the approximate HST detector frame using ORIENTAT
+        # Rotate Gaia positions into the approximate detector frame using the
+        # aperture position angle (ORIENTAT for HST, PA_APER for JWST)
         theta_init = np.radians(-params['orientat'])
         init_rot_mat    = np.array([[ np.cos(theta_init), np.sin(theta_init)],
                                     [-np.sin(theta_init), np.cos(theta_init)]])
@@ -742,7 +852,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         gaia_err_total = np.power(np.linalg.det(C_pix_gaia), 0.25)
         has_gaia_pms = np.isfinite(gaia_df['pmra'].to_numpy())
 
-        # --- Filter to stars near the HST field ---
+        # --- Filter to stars near the field ---
         margin = 3000
         in_field = (np.abs(x_gaia_proj - params['x_cen']) <= margin) & \
                    (np.abs(y_gaia_proj - params['y_cen']) <= margin)
@@ -761,11 +871,11 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         ra_in, dec_in = ra_prop[in_field], dec_prop[in_field]
         in_has_pms = has_gaia_pms[in_field]
 
-        # --- Load HST catalog ---
-        hst_cat = fits.getdata(hst['catalog'])
+        # --- Load catalog ---
+        cat = fits.getdata(img['catalog'])
 
         # Require is_star_candidate; skip image if absent
-        if 'is_star_candidate' not in hst_cat.dtype.names:
+        if 'is_star_candidate' not in cat.dtype.names:
             msg = (f'\n  WARNING: {image_name} catalog is missing the '
                    f'is_star_candidate column — image SKIPPED.\n'
                    f'  Re-run PSF fitting to produce updated catalogs before cross-matching.')
@@ -773,38 +883,42 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             print(f'Finished {image_name}: SKIPPED — no is_star_candidate column.', file=original_stdout)
             return
 
-        _orig_row_idx = np.arange(len(hst_cat))
-        _valid = (np.isfinite(hst_cat['x_gdc'].astype(float)) &
-                  np.isfinite(hst_cat['y_gdc'].astype(float)))
+        _orig_row_idx = np.arange(len(cat))
+        _valid = (np.isfinite(cat['x_gdc'].astype(float)) &
+                  np.isfinite(cat['y_gdc'].astype(float)))
         if not _valid.all():
-            print(f'  Dropping {(~_valid).sum()} NaN/inf rows from HST catalog')
-            hst_cat = hst_cat[_valid]
+            print(f'  Dropping {(~_valid).sum()} NaN/inf rows from catalog')
+            cat = cat[_valid]
             _orig_row_idx = _orig_row_idx[_valid]
-        x_hst      = hst_cat['x_gdc'].astype(float)
-        y_hst      = hst_cat['y_gdc'].astype(float)
-        mag_hst_gdc = hst_cat['mag_gdc'].astype(float)
-        is_star    = hst_cat['is_star_candidate'].astype(bool)
-        mag_err_hst = hst_cat['mag_err_gdc'].astype(float) if 'mag_err_gdc' in hst_cat.dtype.names else None
-        if 'mag_st_gdc' not in hst_cat.dtype.names:
+        x_img       = cat['x_gdc'].astype(float)
+        y_img       = cat['y_gdc'].astype(float)
+        mag_img_gdc = cat['mag_gdc'].astype(float)
+        is_star     = cat['is_star_candidate'].astype(bool)
+        mag_err_img = cat['mag_err_gdc'].astype(float) if 'mag_err_gdc' in cat.dtype.names else None
+        if 'mag_st_gdc' not in cat.dtype.names:
+            if telescope == 'JWST':
+                legacy_tool = 'jwst1pass'
+            else:
+                legacy_tool = 'py1pass'
             raise ValueError(
-                f"Catalog missing 'mag_st_gdc' column — stale py1pass output. "
-                f"Delete the catalog so py1pass will re-run."
+                f"Catalog missing 'mag_st_gdc' column — stale {legacy_tool} output. "
+                f"Delete the catalog so {legacy_tool} will re-run."
             )
-        mag_hst = hst_cat['mag_st_gdc'].astype(float)
-        mag_st_hst  = mag_hst   # kept for output saving below
-        mag_ab_hst  = hst_cat['mag_ab'].astype(float)     if 'mag_ab'      in hst_cat.dtype.names else None
-        C_pix_hst = np.zeros((len(x_hst), 2, 2))
-        C_pix_hst[:, 0, 0] = hst_cat['cov_xx_gdc'].astype(float) + hst_pix_floor**2
-        C_pix_hst[:, 1, 1] = hst_cat['cov_yy_gdc'].astype(float) + hst_pix_floor**2
-        C_pix_hst[:, 0, 1] = hst_cat['cov_xy_gdc'].astype(float)
-        C_pix_hst[:, 1, 0] = C_pix_hst[:, 0, 1]
+        mag_img    = cat['mag_st_gdc'].astype(float)
+        mag_st_img = mag_img   # kept for output saving below
+        mag_ab_img = cat['mag_ab'].astype(float) if 'mag_ab' in cat.dtype.names else None
+        C_pix_img = np.zeros((len(x_img), 2, 2))
+        C_pix_img[:, 0, 0] = cat['cov_xx_gdc'].astype(float) + hst_pix_floor**2
+        C_pix_img[:, 1, 1] = cat['cov_yy_gdc'].astype(float) + hst_pix_floor**2
+        C_pix_img[:, 0, 1] = cat['cov_xy_gdc'].astype(float)
+        C_pix_img[:, 1, 0] = C_pix_img[:, 0, 1]
 
         n_stars = is_star.sum()
-        print(f'  HST catalog: {len(x_hst)} sources, {n_stars} star candidates ({100*n_stars/len(x_hst):.1f}%)')
+        print(f'  {telescope} catalog: {len(x_img)} sources, {n_stars} star candidates ({100*n_stars/len(x_img):.1f}%)')
 
         # Scale-adjusted Gaia guess positions for seeding.
-        # initial_scale is the HST→Gaia scale from the 4P fit, so the inverse
-        # (Gaia→HST) is 1/initial_scale — same logic as using init_inv_rot_mat.
+        # initial_scale is the detector→Gaia scale from the 4P fit, so the inverse
+        # (Gaia→detector) is 1/initial_scale — same logic as using init_inv_rot_mat.
         inv_initial_scale = 1.0 / params['initial_scale']
         xg_guess_in = params['x_cen'] + (x_g_in - params['x_cen']) * inv_initial_scale
         yg_guess_in = params['y_cen'] + (y_g_in - params['y_cen']) * inv_initial_scale
@@ -819,21 +933,21 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         # refinement and final pass use all sources: non-stars contribute
         # additional positional constraints once a good transform seed exists.
         star_indices = np.where(is_star)[0]   # full-array indices of star candidates
-        hst_data = {
-            'x': x_hst[is_star], 'y': y_hst[is_star], 'mag': mag_hst[is_star],
-            'C': C_pix_hst[is_star],
-            'qfit': hst_cat['qfit'].astype(float)[is_star],
-            'chi2': hst_cat['chi2'].astype(float)[is_star],
+        img_data = {
+            'x': x_img[is_star], 'y': y_img[is_star], 'mag': mag_img[is_star],
+            'C': C_pix_img[is_star],
+            'qfit': cat['qfit'].astype(float)[is_star],
+            'chi2': cat['chi2'].astype(float)[is_star],
         }
         # All sources (stars + non-stars) for 6P refinement and final pass.
-        hst_data_all = {
-            'x': x_hst, 'y': y_hst, 'mag': mag_hst,
-            'C': C_pix_hst,
+        img_data_all = {
+            'x': x_img, 'y': y_img, 'mag': mag_img,
+            'C': C_pix_img,
         }
         tree_gaia_all = KDTree(np.column_stack([x_g_in, y_g_in]))
 
         # --- 4P Discovery ---
-        best = _run_4p_discovery(hst_data, gaia_field, params, max_mag_diff, scale_sweep=scale_sweep, discovery_max_offset=discovery_max_offset)
+        best = _run_4p_discovery(img_data, gaia_field, params, max_mag_diff, scale_sweep=scale_sweep, discovery_max_offset=discovery_max_offset)
         if best is None:
             print(f"Finished {image_name}: 4P Discovery failed to find physically plausible matches.", file=original_stdout)
             return
@@ -841,27 +955,27 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
               f"({best['n_match']} stars, red_chi2={best['red_chi2']:.2f}, red_cost={best['red_cost']:.2f})")
 
         # --- Save offset histogram plot for the best discovery tier ---
-        _save_offset_histogram(best, image_name, hst['root'])
+        _save_offset_histogram(best, image_name, img['root'], telescope=telescope)
 
         # --- Affine Refinement (all sources) ---
-        # Seed indices from 4P discovery are into hst_data (star-only); remap
+        # Seed indices from 4P discovery are into img_data (star-only); remap
         # them to full-array indices so _run_affine_refinement can work with
-        # hst_data_all which contains every source.
+        # img_data_all which contains every source.
         best_all = {**best, 'h_v': star_indices[best['h_v']]}
         A, B, C, D, xs_o, ys_o, xt_o, yt_o, C_params, resid_cov, zp, h_f, g_f = \
-            _run_affine_refinement(best_all, hst_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor)
+            _run_affine_refinement(best_all, img_data_all, gaia_field, tree_gaia_all, max_mag_diff, use_resid_floor=use_resid_floor)
         M = np.array([[A, B], [C, D]])
 
         # --- Final pass: gather all candidates with the converged transform ---
-        xh_in_g, yh_in_g = apply_affine(x_hst, y_hst, A, B, C, D, xs_o, ys_o, xt_o, yt_o)
+        xh_in_g, yh_in_g = apply_affine(x_img, y_img, A, B, C, D, xs_o, ys_o, xt_o, yt_o)
         ds, g_idxs = tree_gaia_all.query(np.column_stack([xh_in_g, yh_in_g]), k=5, distance_upper_bound=100)
-        h_idx_all = np.repeat(np.arange(len(x_hst)), 5)
+        h_idx_all = np.repeat(np.arange(len(x_img)), 5)
         valid = ds.flatten() < 100
         h_v, g_v = h_idx_all[valid], g_idxs.flatten()[valid]
 
         dx_v, dy_v = x_g_in[g_v] - xh_in_g[h_v], y_g_in[g_v] - yh_in_g[h_v]
-        C_proj = np.einsum('ij,njk,lk->nil', M, C_pix_hst[h_v], M)
-        dxh_v, dyh_v = x_hst[h_v] - xs_o, y_hst[h_v] - ys_o
+        C_proj = np.einsum('ij,njk,lk->nil', M, C_pix_img[h_v], M)
+        dxh_v, dyh_v = x_img[h_v] - xs_o, y_img[h_v] - ys_o
         J = np.zeros((len(h_v), 2, 6))
         J[:, 0, 0], J[:, 0, 1], J[:, 0, 2] = dxh_v, dyh_v, 1.0
         J[:, 1, 3], J[:, 1, 4], J[:, 1, 5] = dxh_v, dyh_v, 1.0
@@ -870,7 +984,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
 
         sigs_v = compute_mahalanobis(dx_v, dy_v, C_total)
         costs_v = compute_logprob_cost(dx_v, dy_v, C_total)
-        mag_diffs = g_mag_in[g_v] - mag_hst[h_v]
+        mag_diffs = g_mag_in[g_v] - mag_img[h_v]
         costs_v += ((mag_diffs - zp) / 1.0)**2
         costs_v[np.abs(mag_diffs - zp) > max_mag_diff] = np.inf
 
@@ -890,6 +1004,10 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             return
 
         # --- Build diagnostic dataframe ---
+        if telescope == 'JWST':
+            star_col, color_col = 'is_star', 'color_jwst'
+        else:
+            star_col, color_col = 'hst_is_star', 'color_hst'
         diag_df = pd.DataFrame({
             'h_idx': all_mdf['h'], 'g_idx': all_mdf['g'],
             'x': x_g_in[all_mdf['g']], 'y': y_g_in[all_mdf['g']],
@@ -897,13 +1015,13 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             'ra': ra_in[all_mdf['g']], 'dec': dec_in[all_mdf['g']],
             'dx': all_mdf['dx'], 'dy': all_mdf['dy'],
             'sigma': all_mdf['s'], 'cxx': all_mdf['cxx'], 'cyy': all_mdf['cyy'],
-            'mag': g_mag_in[all_mdf['g']], 'mag_hst': mag_hst[all_mdf['h']],
+            'mag': g_mag_in[all_mdf['g']], 'mag_img': mag_img[all_mdf['h']],
             'pmra': g_pmra_in[all_mdf['g']], 'pmdec': g_pmdec_in[all_mdf['g']],
-            'hst_is_star': is_star[all_mdf['h'].values],
+            star_col: is_star[all_mdf['h'].values],
         })
         if g_color_in is not None:
             diag_df['color'] = g_color_in[diag_df['g_idx']]
-        diag_df['color_hst'] = diag_df['mag'] - diag_df['mag_hst'] - zp
+        diag_df[color_col] = diag_df['mag'] - diag_df['mag_img'] - zp
 
         final_match_keys = set(zip(h_final, g_final))
         is_m = diag_df.apply(lambda r: (int(r.h_idx), int(r.g_idx)) in final_match_keys, axis=1)
@@ -912,34 +1030,35 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
             return
 
         # --- Save outputs ---
-        save_diagnostic_plots(hst['root'], image_name, diag_df[is_m], diag_df[~is_m])
+        save_diagnostic_plots(img['root'], image_name, diag_df[is_m], diag_df[~is_m], telescope=telescope)
         final_matches = diag_df[is_m].copy()
 
+        prefix = 'jwst' if telescope == 'JWST' else 'hst'
         output = Table()
-        output['hst_index']      = _orig_row_idx[final_matches['h_idx'].values]
-        output['hst_x_gdc']      = x_hst[final_matches['h_idx'].values]
-        output['hst_y_gdc']      = y_hst[final_matches['h_idx'].values]
-        output['hst_mag_gdc']    = mag_hst_gdc[final_matches['h_idx'].values]
-        if mag_err_hst is not None:
-            output['hst_mag_err_gdc']= mag_err_hst[final_matches['h_idx'].values]
-        if mag_st_hst is not None:
-            output['hst_mag_st_gdc'] = mag_st_hst[final_matches['h_idx'].values]
-        if mag_ab_hst is not None:
-            output['hst_mag_ab']     = mag_ab_hst[final_matches['h_idx'].values]
+        output[f'{prefix}_index']      = _orig_row_idx[final_matches['h_idx'].values]
+        output[f'{prefix}_x_gdc']      = x_img[final_matches['h_idx'].values]
+        output[f'{prefix}_y_gdc']      = y_img[final_matches['h_idx'].values]
+        output[f'{prefix}_mag_gdc']    = mag_img_gdc[final_matches['h_idx'].values]
+        if mag_err_img is not None:
+            output[f'{prefix}_mag_err_gdc'] = mag_err_img[final_matches['h_idx'].values]
+        if mag_st_img is not None:
+            output[f'{prefix}_mag_st_gdc']  = mag_st_img[final_matches['h_idx'].values]
+        if mag_ab_img is not None:
+            output[f'{prefix}_mag_ab']      = mag_ab_img[final_matches['h_idx'].values]
         output['gaia_source_id'] = gaia_df.iloc[in_field]['source_id'].to_numpy(dtype=np.int64)[final_matches['g_idx'].values]
         output['has_gaia_pms']   = has_gaia_pms[in_field][final_matches['g_idx'].values]
         output['gaia_ra_prop']   = ra_in[final_matches['g_idx'].values]
         output['gaia_dec_prop']  = dec_in[final_matches['g_idx'].values]
         output['gaia_gmag']      = g_mag_in[final_matches['g_idx'].values]
         # residual_mag uses the same calibrated magnitude that was used for ZP
-        # estimation (mag_hst = mag_st_gdc when available, else mag_gdc).
-        mag_hst_for_resid = mag_hst[final_matches['h_idx'].values]
-        output['residual_mag']   = output['gaia_gmag'] - (mag_hst_for_resid + zp)
+        # estimation (mag_img = mag_st_gdc when available, else mag_gdc).
+        mag_img_for_resid = mag_img[final_matches['h_idx'].values]
+        output['residual_mag']   = output['gaia_gmag'] - (mag_img_for_resid + zp)
         output['residual_x']     = final_matches['dx'].values
         output['residual_y']     = final_matches['dy'].values
         output['residual_sigma'] = final_matches['sigma'].values
-        output['hst_is_star']    = is_star[final_matches['h_idx'].values]
-        output.write(os.path.join(hst['root'], "matched_gaia.csv"), format='ascii.csv', overwrite=True)
+        output[star_col]         = is_star[final_matches['h_idx'].values]
+        output.write(os.path.join(img['root'], "matched_gaia.csv"), format='ascii.csv', overwrite=True)
 
         ratio, rot = np.sqrt(A*D - B*C), np.degrees(np.arctan2(B-C, A+D))
         on_skew, off_skew = 0.5*(A-D), 0.5*(B+C)
@@ -952,7 +1071,7 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
                                params['ra_cen'], params['dec_cen'],
                                params['x_cen'], params['y_cen'],
                                params['pixel_scale'], params['orientat']]
-        trans_out.write(os.path.join(hst['root'], "transformation.csv"), format='ascii.csv', overwrite=True)
+        trans_out.write(os.path.join(img['root'], "transformation.csv"), format='ascii.csv', overwrite=True)
         print(f"Finished {image_name}: Found {len(final_matches)} matches in {time.time()-start_time:.2f}s.", file=original_stdout)
 
     except Exception as e:
@@ -961,15 +1080,17 @@ def process_single_image(hst, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         sys.stdout = original_stdout
 
 def main():
-    parser = argparse.ArgumentParser(description="Parallel Gaia-HST catalog cross-matcher with covariance weighting and magnitude rejection.")
+    parser = argparse.ArgumentParser(description="Parallel Gaia-HST/JWST catalog cross-matcher with covariance weighting and magnitude rejection.")
     parser.add_argument("--target", required=True,
-                        help="Target name (e.g. Fornax_dSph). Expects data in [data_dir]/[target]/Gaia and [data_dir]/[target]/HST")
+                        help="Target name (e.g. Fornax_dSph). Expects data in [data_dir]/[target]/Gaia and [data_dir]/[target]/HST or JWST")
+    parser.add_argument("--telescope", choices=["HST", "JWST"], default="HST",
+                        help="Telescope whose catalogs to cross-match. Default: HST")
     parser.add_argument("--data-dir", default="./data",
                         help="Root directory containing target data folders. Default: ./data")
     parser.add_argument("--threads", type=int, default=os.cpu_count(),
                         help="Number of parallel processing threads. Default: All available cores")
     parser.add_argument("--hst-pix-floor", type=float, default=0.01,
-                        help="Minimum HST positional uncertainty (pixels) added in quadrature to reported errors. Default: 0.01")
+                        help="Minimum positional uncertainty (pixels) added in quadrature to reported errors. Default: 0.01")
     parser.add_argument("--min-matches", type=int, default=3,
                         help="Minimum number of seeds required for initial match. Default: 3")
     parser.add_argument("--zero-gaia-pm", action="store_true",
@@ -983,20 +1104,23 @@ def main():
     gaia_df = load_gaia_data(args.target, args.data_dir)
     if gaia_df is None: return
 
-    hst_folders = find_hst_image_folders(args.target, args.data_dir)
+    img_folders = find_hst_image_folders(args.target, args.data_dir, telescope=args.telescope)
     if args.image:
-        hst_folders = [h for h in hst_folders if h['root'].split('/')[-1] == args.image]
-        if not hst_folders:
+        img_folders = [i for i in img_folders if i['root'].split('/')[-1] == args.image]
+        if not img_folders:
             print(f"No image folder found for '{args.image}'"); return
-    print(f"Found {len(hst_folders)} images. Processing with {args.threads} threads...")
+    print(f"Found {len(img_folders)} images. Processing with {args.threads} threads...")
 
     with ProcessPoolExecutor(max_workers=args.threads) as executor:
-        futures = {executor.submit(process_single_image, hst, gaia_df, args.hst_pix_floor, args.min_matches, args.zero_gaia_pm, scale_sweep=args.scale_sweep): hst for hst in hst_folders}
+        futures = {executor.submit(process_single_image, img, gaia_df, args.hst_pix_floor, args.min_matches, args.zero_gaia_pm, scale_sweep=args.scale_sweep, telescope=args.telescope): img for img in img_folders}
         for f in as_completed(futures):
             f.result()
     print("All tasks completed.")
 
-    from .validator import validate_target
+    if args.telescope == 'JWST':
+        from .validator_jwst import validate_target
+    else:
+        from .validator import validate_target
     print("\n--- Running cross-image validation ---")
     validate_target(args.target, args.data_dir)
 

@@ -14,6 +14,40 @@ from collections import defaultdict
 import numpy as np
 from astropy.io import fits
 
+# Kept in sync with gaia_cross_match/cross_match_jwst.py::_JWST_PIXEL_SCALE
+# so the report can show how far the measured scale is from what the
+# pipeline currently uses as its initial-guess pixel scale.
+CURRENT_JWST_PIXEL_SCALE = {
+    'NIRCAM_NRCA1':    0.031227,
+    'NIRCAM_NRCA2':    0.030778,
+    'NIRCAM_NRCA3':    0.03134,
+    'NIRCAM_NRCA4':    0.0309,
+    'NIRCAM_NRCALONG': 0.062906,
+    'NIRCAM_NRCB1':    0.030746,
+    'NIRCAM_NRCB2':    0.031194,
+    'NIRCAM_NRCB3':    0.030872,
+    'NIRCAM_NRCB4':    0.031326,
+    'NIRCAM_NRCBLONG': 0.063001,
+    'NIRISS':          0.065567,
+    'MIRI':            0.110913,
+}
+CURRENT_JWST_PIXEL_SCALE_FALLBACK = {
+    'NIRCAM_SW': 0.031,
+    'NIRCAM_LW': 0.063,
+}
+
+
+def current_pixel_scale(instrume, detector):
+    """Mirror gaia_cross_match.cross_match_jwst.get_jwst_params's lookup logic."""
+    if instrume == 'NIRCAM':
+        key = f'NIRCAM_{detector}'
+        if key in CURRENT_JWST_PIXEL_SCALE:
+            return CURRENT_JWST_PIXEL_SCALE[key]
+        if any(s in detector for s in ('LONG', 'AL')):
+            return CURRENT_JWST_PIXEL_SCALE_FALLBACK['NIRCAM_LW']
+        return CURRENT_JWST_PIXEL_SCALE_FALLBACK['NIRCAM_SW']
+    return CURRENT_JWST_PIXEL_SCALE.get(instrume)
+
 
 def cd_pixel_scale_arcsec(sci_hdr):
     """Geometric-mean pixel scale (arcsec/px) from the SCI-extension CD matrix."""
@@ -86,9 +120,18 @@ def main():
     log("\n=== Per-detector average pixel scale ===")
     for (instrume, detector), scales in sorted(per_detector.items()):
         scales = np.array(scales)
-        log(f"{instrume:8s} {detector:10s} n={len(scales):3d}  "
-            f"mean={scales.mean():.6f}  median={np.median(scales):.6f}  std={scales.std():.6f}  "
-            f"min={scales.min():.6f}  max={scales.max():.6f}")
+        median = np.median(scales)
+        current = current_pixel_scale(instrume, detector)
+        line = (f"{instrume:8s} {detector:10s} n={len(scales):3d}  "
+                f"mean={scales.mean():.6f}  median={median:.6f}  std={scales.std():.6f}  "
+                f"min={scales.min():.6f}  max={scales.max():.6f}")
+        if current is not None:
+            delta = median - current
+            pct = 100.0 * delta / current
+            line += f"  |  current_config={current:.6f}  delta={delta:+.6f} ({pct:+.3f}%)"
+        else:
+            line += "  |  current_config=<no match>"
+        log(line)
 
     if skipped:
         log(f"\n{len(skipped)} file(s) skipped due to errors (see above).")

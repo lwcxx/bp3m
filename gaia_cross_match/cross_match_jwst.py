@@ -53,27 +53,13 @@ def find_hst_image_folders(target, data_dir):
     return folders
 
 
-# Per-detector pixel scales (arcsec/px), measured directly from _cal.fits
-# WCS CD-matrix determinants (see measure_pixel_scale.py; bp3m/CLAUDE.md).
+# Nominal pixel scales (arcsec/px) by instrument/channel group.
 _JWST_PIXEL_SCALE = {
-    'NIRCAM_NRCA1':    0.031227,
-    'NIRCAM_NRCA2':    0.030778,
-    'NIRCAM_NRCA3':    0.03134,
-    'NIRCAM_NRCA4':    0.0309,
-    'NIRCAM_NRCALONG': 0.062906,
-    'NIRCAM_NRCB1':    0.030746,
-    'NIRCAM_NRCB2':    0.031194,
-    'NIRCAM_NRCB3':    0.030872,
-    'NIRCAM_NRCB4':    0.031326,
-    'NIRCAM_NRCBLONG': 0.063001,
-    'NIRISS':          0.065567,
-    'MIRI':            0.110913,
+    'NIRCAM_SW': 0.031,
+    'NIRCAM_LW': 0.063,
+    'NIRISS':    0.066,
+    'MIRI':      0.111,
 }
-_JWST_PIXEL_SCALE_FALLBACK = {
-    'NIRCAM_SW': 0.031,   # fallback: unrecognised NIRCam SW detector
-    'NIRCAM_LW': 0.063,   # fallback: unrecognised NIRCam LW detector
-}
-
 
 def get_jwst_params(cal_file):
     """Extract astrometric parameters from a JWST _cal.fits file.
@@ -101,20 +87,52 @@ def get_jwst_params(cal_file):
                   sci_hdr.get('ORIENTAT',
                   hdr0.get('PA_V3', 0.0)))
 
-        if instrume == 'NIRCAM':
-            key = f'NIRCAM_{detector}'
-            if key in _JWST_PIXEL_SCALE:
-                pixel_scale = _JWST_PIXEL_SCALE[key]
-            elif any(s in detector for s in ('LONG', 'AL')):
-                pixel_scale = _JWST_PIXEL_SCALE_FALLBACK['NIRCAM_LW']
-            else:
-                pixel_scale = _JWST_PIXEL_SCALE_FALLBACK['NIRCAM_SW']
+        # initial_scale = measured detector pixel scale / nominal group pixel
+        # scale above, so pixel_scale * initial_scale reproduces the WCS-measured
+        # value (see bp3m/CLAUDE.md for the per-detector measurements).
+        if instrume == 'NIRCAM' and detector == 'NRCA1':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+            initial_scale = 1.0073
+        elif instrume == 'NIRCAM' and detector == 'NRCA2':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+            initial_scale = 0.9928
+        elif instrume == 'NIRCAM' and detector == 'NRCA3':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+            initial_scale = 1.0110
+        elif instrume == 'NIRCAM' and detector == 'NRCA4':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+            initial_scale = 0.9968
+        elif instrume == 'NIRCAM' and detector == 'NRCALONG':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_LW']
+            initial_scale = 0.9985
+        elif instrume == 'NIRCAM' and detector == 'NRCB1':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+            initial_scale = 0.9918
+        elif instrume == 'NIRCAM' and detector == 'NRCB2':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+            initial_scale = 1.0063
+        elif instrume == 'NIRCAM' and detector == 'NRCB3':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+            initial_scale = 0.9959
+        elif instrume == 'NIRCAM' and detector == 'NRCB4':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_SW']
+            initial_scale = 1.0105
+        elif instrume == 'NIRCAM' and detector == 'NRCBLONG':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_LW']
+            initial_scale = 1.0
+        elif instrume == 'NIRCAM':
+            pixel_scale = _JWST_PIXEL_SCALE['NIRCAM_LW'] if any(s in detector for s in ('LONG', 'AL')) \
+                          else _JWST_PIXEL_SCALE['NIRCAM_SW']
+            initial_scale = 1.0
         elif instrume == 'NIRISS':
             pixel_scale = _JWST_PIXEL_SCALE['NIRISS']
+            initial_scale = 0.9934
         elif instrume == 'MIRI':
             pixel_scale = _JWST_PIXEL_SCALE['MIRI']
+            initial_scale = 0.9992
         else:
             pixel_scale = 0.066
+            initial_scale = 1.0
 
         exp_start = hdr0.get('EXPSTART', hdr0.get('MJD-BEG', 51544.0))
         exp_end   = hdr0.get('EXPEND',   hdr0.get('MJD-END', exp_start))
@@ -126,7 +144,7 @@ def get_jwst_params(cal_file):
         'x_cen':         x_cen,
         'y_cen':         y_cen,
         'pixel_scale':   pixel_scale,
-        'initial_scale': 1.0,
+        'initial_scale': initial_scale,
         'obs_epoch_mjd': expstart,
         'orientat':      pa_aper,
         'naxis1':        naxis1,
@@ -973,7 +991,7 @@ def main():
             f.result()
     print("All tasks completed.")
 
-    from .validator import validate_target
+    from .validator_jwst import validate_target
     print("\n--- Running cross-image validation ---")
     validate_target(args.target, args.data_dir)
 
