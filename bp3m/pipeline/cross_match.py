@@ -1,20 +1,15 @@
 """
-Step 4: Cross-match HST PSF catalogs against Gaia using gaia_cross_match.
+Step 4: Cross-match HST/JWST PSF catalogs against Gaia using gaia_cross_match.
 
-For each image directory that contains {obs_id}_flc_catalog.fits, calls
-gaia_cross_match.cross_match.process_single_image and writes:
-    matched_gaia.csv        — HST↔Gaia matched pairs
+For each image directory that contains {obs_id}_flc_catalog.fits (HST) or
+{obs_id}_cal_catalog.fits (JWST), calls gaia_cross_match.cross_match.process_single_image
+and writes:
+    matched_gaia.csv        — HST/JWST↔Gaia matched pairs
     transformation.csv      — affine transformation parameters
     diagnostic_plots.png    — 8-panel diagnostic figure
     offset_histogram.png    — 2D offset histogram from discovery step
 
 Gaia data is loaded from {output_dir}/{field}/Gaia/*.csv.
-
-Extension note
---------------
-JWST cross-matching will use the same gaia_cross_match code once it handles
-JWST-specific pixel scales and FITS header conventions. Pass telescope='JWST'
-once that support is in place.
 """
 
 from __future__ import annotations
@@ -141,6 +136,7 @@ def _match_one(args):
             scale_sweep=kwargs.get('scale_sweep', False),
             discovery_max_offset=kwargs.get('discovery_max_offset', 50),
             use_resid_floor=kwargs.get('use_resid_floor', True),
+            telescope=kwargs.get('telescope', 'HST'),
         )
         out = root / 'matched_gaia.csv'
         n = len(pd.read_csv(str(out))) if out.exists() else 0
@@ -163,7 +159,7 @@ def run_cross_match(
     output_dir: Path,
     field_name: str,
     telescope: str = 'HST',
-    im_type: str = '_flc',
+    im_type: str | None = None,
     n_processes: int = 4,
     hst_pix_floor: float = 0.05,
     min_matches: int = 3,
@@ -186,7 +182,7 @@ def run_cross_match(
     ----------
     output_dir           : pipeline root directory
     field_name           : field subdirectory name
-    telescope            : 'HST' (JWST planned)
+    telescope            : 'HST' or 'JWST'
     n_processes          : parallel workers
     hst_pix_floor        : minimum positional uncertainty floor (pixels)
     min_matches          : minimum seed matches required for 4P discovery
@@ -204,16 +200,13 @@ def run_cross_match(
     -------
     List of matched_gaia.csv paths
     """
-    if telescope.upper() != 'HST':
-        raise NotImplementedError(
-            "Cross-matching for non-HST telescopes is not yet implemented. "
-            "JWST support is planned once gaia_cross_match handles JWST headers."
-        )
+    if im_type is None:
+        im_type = '_cal' if telescope == 'JWST' else '_flc'
 
     from gaia_cross_match.cross_match import load_gaia_data
 
     print("\n" + "─"*50)
-    print("Step 4: Cross-matching HST ↔ Gaia")
+    print(f"Step 4: Cross-matching {telescope} ↔ Gaia")
     print("─"*50)
 
     gaia_df = load_gaia_data(field_name, str(Path(output_dir)))
@@ -221,8 +214,12 @@ def run_cross_match(
         print("  ERROR: could not load Gaia catalogue.")
         return []
 
-    folders = _find_image_folders(output_dir, field_name,
-                                   telescope=telescope, im_type=im_type)
+    if telescope == 'JWST':
+        from gaia_cross_match.cross_match import find_hst_image_folders
+        folders = find_hst_image_folders(field_name, str(Path(output_dir)), telescope='JWST')
+    else:
+        folders = _find_image_folders(output_dir, field_name,
+                                       telescope=telescope, im_type=im_type)
     if image_id:
         folders = [f for f in folders if Path(f['root']).name == image_id]
 
@@ -263,8 +260,11 @@ def run_cross_match(
         # Skip images without photometric calibration — their mag column is all
         # NaN so they cannot contribute to magnitude-based cross-matching.
         if not _has_mag_calibration(Path(hst['catalog'])):
-            _write_xmatch_status(root, 'skipped', params_meta,
-                                  reason='no photometric calibration (PHOTFLAM/EXPTIME missing)')
+            if telescope == 'JWST':
+                nophot_reason = 'no photometric calibration (PIXAR_SR missing or mag all-NaN)'
+            else:
+                nophot_reason = 'no photometric calibration (PHOTFLAM/EXPTIME missing)'
+            _write_xmatch_status(root, 'skipped', params_meta, reason=nophot_reason)
             skipped_nophot.append(name)
             continue
 
@@ -277,12 +277,14 @@ def run_cross_match(
             'discovery_max_offset': discovery_max_offset,
             'use_resid_floor':      use_resid_floor,
             'params_meta':          params_meta,
+            'telescope':            telescope,
         }))
 
     if skipped:
         print(f"  {len(skipped)} image(s) already matched — skipping.")
     if skipped_nophot:
-        print(f"  {len(skipped_nophot)} image(s) skipped — no photometric calibration (PHOTFLAM missing): "
+        nophot_label = 'PIXAR_SR missing' if telescope == 'JWST' else 'PHOTFLAM missing'
+        print(f"  {len(skipped_nophot)} image(s) skipped — no photometric calibration ({nophot_label}): "
               f"{', '.join(skipped_nophot)}")
     if not work:
         print("  All cross-matches up to date.")
@@ -331,7 +333,7 @@ def run_cross_match(
     try:
         from gaia_cross_match.validator import validate_target
         print("\n  Running cross-image validation...")
-        validate_target(field_name, str(Path(output_dir)))
+        validate_target(field_name, str(Path(output_dir)), telescope=telescope)
     except Exception as _e:
         print(f"  WARNING: cross-image validation failed — {_e}")
 

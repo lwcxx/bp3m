@@ -32,6 +32,7 @@ def run_alignment(  # noqa: C901
     mcmc_posteriors: bool = False,
     clip_sigma: float = 4.5,
     poly_order: int = 1,
+    telescope: str = 'HST',
     split_ccd: bool = True,
     min_stars_split_ccd: int = 20,
     use_sparse: bool = False,
@@ -64,6 +65,7 @@ def run_alignment(  # noqa: C901
     n_samples        : posterior samples for marginalisation
     clip_sigma       : MAD sigma for outlier rejection (0 = disabled)
     poly_order       : polynomial order for image transformation (1 = linear)
+    telescope        : 'HST' or 'JWST'; passed through to data_loader_flc.load_image_data_flc
     split_ccd        : split ACS/WFC images into independent CCD halves
     min_stars_split_ccd : minimum stars per CCD half to allow splitting (default 20)
     use_sparse       : use sparse Schur-complement solver (faster for mosaics)
@@ -125,9 +127,9 @@ def run_alignment(  # noqa: C901
     print(f"  run_bp3m command:\n    {_cmd}")
 
     # ── Load data ─────────────────────────────────────────────────────────────
-    print(f"\n  Loading FLC pipeline data for '{field_name}'...")
+    print(f"\n  Loading {telescope} pipeline data for '{field_name}'...")
     imgs, stars_per_image, gaia_catalog = load_image_data_flc(
-        data_root, field_name, pos_err_floor=pos_err_floor)
+        data_root, field_name, pos_err_floor=pos_err_floor, telescope=telescope)
     if imgs is None or len(imgs) == 0:
         raise RuntimeError(
             f"No usable images found for '{field_name}'. "

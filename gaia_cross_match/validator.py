@@ -1,10 +1,11 @@
 """
-cross_match_validator.py - Cross-image validation of Gaia-HST cross-matches.
+cross_match_validator.py - Cross-image validation of Gaia-HST/JWST cross-matches.
 
 For each target, groups processed images by filter/camera, then:
 
   1. Writes per-image source_quality.csv annotating each matched source with:
-       mag_normalized     = hst_mag_st_gdc + cross_image_zp  (comparable across images)
+       mag_normalized     = mag_st_gdc + cross_image_zp  (comparable across images;
+                             hst_mag_st_gdc for HST, jwst_mag_st_gdc for JWST)
        n_same_filter      = number of same-filter/camera images also matching this Gaia source
        mag_norm_mad       = MAD of mag_normalized across those images
        mag_residual       = deviation from cross-image median
@@ -15,12 +16,12 @@ For each target, groups processed images by filter/camera, then:
 
   2. Writes a per-target cross_match_catalog.csv with one row per
      (gaia_source_id, filter_camera) pair:
-       gaia_source_id, filter_camera, n_images, image_list, hst_index_list,
+       gaia_source_id, filter_camera, n_images, image_list, hst_index_list/jwst_index_list,
        mag_norm_mean, mag_norm_std, mag_norm_mad, is_consistent
 
 Usage:
     conda activate pymc_new
-    python cross_match_validator.py --target Fornax_dSph --data-dir ./data
+    python cross_match_validator.py --target Fornax_dSph --data-dir ./data --telescope HST
 """
 
 import os
@@ -36,7 +37,15 @@ from collections import defaultdict
 # Data loading
 # ---------------------------------------------------------------------------
 
-def _science_filter(h0):
+def _science_filter(h0, telescope='HST'):
+    if telescope == 'JWST':
+        instrume = h0.get('INSTRUME', '').strip().upper()
+        filt  = h0.get('FILTER', '').strip().upper()
+        pupil = h0.get('PUPIL',  '').strip().upper()
+        if instrume == 'NIRISS' and filt == 'CLEAR':
+            return pupil
+        return filt
+
     # WFC3 (and other single-wheel instruments) use a single FILTER keyword.
     single = h0.get('FILTER', '').strip()
     if single:
@@ -47,29 +56,34 @@ def _science_filter(h0):
     return f2 if 'CLEAR' in f1 else f1
 
 
-def load_image_data(image_dir, image_name):
+def load_image_data(image_dir, image_name, telescope='HST'):
     matched_path   = os.path.join(image_dir, 'matched_gaia.csv')
     transform_path = os.path.join(image_dir, 'transformation.csv')
-    flc_paths      = glob.glob(os.path.join(image_dir, '*_flc.fits'))
+    if telescope == 'JWST':
+        image_paths = glob.glob(os.path.join(image_dir, '*_cal.fits'))
+        stmag_col   = 'jwst_mag_st_gdc'
+    else:
+        image_paths = glob.glob(os.path.join(image_dir, '*_flc.fits'))
+        stmag_col   = 'hst_mag_st_gdc'
     if not (os.path.exists(matched_path) and
-            os.path.exists(transform_path) and flc_paths):
+            os.path.exists(transform_path) and image_paths):
         return None
 
     matched   = pd.read_csv(matched_path)
     transform = pd.read_csv(transform_path, index_col='parameter')['value']
 
-    with fits.open(flc_paths[0]) as h:
+    with fits.open(image_paths[0]) as h:
         h0 = h[0].header
         h1 = h[1].header
         exptime  = float(h0.get('EXPTIME', 1.0))
-        filt     = _science_filter(h0)
+        filt     = _science_filter(h0, telescope=telescope)
         instrume = h0.get('INSTRUME', '').strip()
         detector = h0.get('DETECTOR', '').strip()
         crval1   = float(h1.get('CRVAL1', 0.0))
         crval2   = float(h1.get('CRVAL2', 0.0))
 
-    has_stmag = ('hst_mag_st_gdc' in matched.columns and
-                 matched['hst_mag_st_gdc'].notna().any())
+    has_stmag = (stmag_col in matched.columns and
+                 matched[stmag_col].notna().any())
 
     return {
         'image_name':    image_name,
@@ -91,13 +105,16 @@ def load_image_data(image_dir, image_name):
     }
 
 
-def find_processed_images(target, data_dir):
-    hst_root = os.path.join(data_dir, target, 'HST')
+def find_processed_images(target, data_dir, telescope='HST'):
+    if telescope == 'JWST':
+        image_root, suffix = os.path.join(data_dir, target, 'JWST'), '_cal'
+    else:
+        image_root, suffix = os.path.join(data_dir, target, 'HST'), '_flc'
     images = {}
-    for root, dirs, files in os.walk(hst_root):
+    for root, dirs, files in os.walk(image_root):
         name = os.path.basename(root)
-        if f'{name}_flc_catalog.fits' in files and 'matched_gaia.csv' in files:
-            data = load_image_data(root, name)
+        if f'{name}{suffix}_catalog.fits' in files and 'matched_gaia.csv' in files:
+            data = load_image_data(root, name, telescope=telescope)
             if data is not None:
                 images[name] = data
     return images
@@ -107,12 +124,13 @@ def find_processed_images(target, data_dir):
 # Magnitude helpers
 # ---------------------------------------------------------------------------
 
-def has_valid_stmag(matched_df):
-    return ('hst_mag_st_gdc' in matched_df.columns and
-            matched_df['hst_mag_st_gdc'].notna().any())
+def has_valid_stmag(matched_df, telescope='HST'):
+    stmag_col = 'jwst_mag_st_gdc' if telescope == 'JWST' else 'hst_mag_st_gdc'
+    return (stmag_col in matched_df.columns and
+            matched_df[stmag_col].notna().any())
 
 
-def compute_pairwise_zps(group):
+def compute_pairwise_zps(group, telescope='HST'):
     """
     For every pair (a, b) of images in `group` that share ≥ 3 sources, compute:
 
@@ -126,17 +144,18 @@ def compute_pairwise_zps(group):
     Returns dict {(name_a, name_b): (zp, n_shared)} for pairs with n_shared ≥ 3,
     with both (a,b) and (b,a) entries (ZPs negated for the reverse direction).
     """
+    stmag_col = 'jwst_mag_st_gdc' if telescope == 'JWST' else 'hst_mag_st_gdc'
     names = list(group.keys())
     result = {}
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             a, b = names[i], names[j]
             df_a = (group[a]['matched']
-                    [['gaia_source_id', 'hst_mag_st_gdc']]
-                    .rename(columns={'hst_mag_st_gdc': 'mag_a'}))
+                    [['gaia_source_id', stmag_col]]
+                    .rename(columns={stmag_col: 'mag_a'}))
             df_b = (group[b]['matched']
-                    [['gaia_source_id', 'hst_mag_st_gdc']]
-                    .rename(columns={'hst_mag_st_gdc': 'mag_b'}))
+                    [['gaia_source_id', stmag_col]]
+                    .rename(columns={stmag_col: 'mag_b'}))
             shared = df_a.merge(df_b, on='gaia_source_id')
             ok = (np.isfinite(shared['mag_a'].values) &
                   np.isfinite(shared['mag_b'].values))
@@ -236,39 +255,45 @@ def wcs_offset_px(d_i, d_ref):
 # ---------------------------------------------------------------------------
 
 def validate_filter_group(group, ref_name, zp_dict, mag_scatter_thr, offset_tol_mag,
-                          offset_tol_px, cross_camera_extra_tol=0.05, z_outlier=3.0):
+                          offset_tol_px, cross_camera_extra_tol=0.05, z_outlier=3.0,
+                          telescope='HST'):
     """
     Validate a set of images forming one overlap-connected component.
 
     zp_dict: {name: zp} pre-computed via propagate_zps_bfs so that
-             mag_norm_i = hst_mag_st_gdc_i + zp_i ≈ hst_mag_st_gdc_ref.
+             mag_norm_i = mag_st_gdc_i + zp_i ≈ mag_st_gdc_ref.
              ref_name has zp = 0.0 by construction.
 
-    All images in `group` must have hst_mag_st_gdc (caller guarantees this).
-    ZPs are never assumed to be 0; they are always derived from direct per-star
-    differences along a spanning tree of the overlap graph.
+    All images in `group` must have a valid stmag column (caller guarantees
+    this). ZPs are never assumed to be 0; they are always derived from direct
+    per-star differences along a spanning tree of the overlap graph.
     """
+    if telescope == 'JWST':
+        stmag_col, mag_err_col = 'jwst_mag_st_gdc', 'jwst_mag_err_gdc'
+    else:
+        stmag_col, mag_err_col = 'hst_mag_st_gdc', 'hst_mag_err_gdc'
+
     ref = group[ref_name]
 
     for name, d in group.items():
         zp = zp_dict[name]
-        d['mag_norm']   = d['matched']['hst_mag_st_gdc'].values + zp
+        d['mag_norm']   = d['matched'][stmag_col].values + zp
         d['cross_zp']   = zp
         d['used_stmag'] = True
 
     # --- Cross-image source magnitude table ---
-    # Error for mag_st_gdc equals hst_mag_err_gdc (STMAG is a linear flux
+    # Error for mag_st_gdc equals mag_err_gdc (STMAG is a linear flux
     # scaling, so fractional errors are identical).  Add a 0.01 mag floor so
     # that near-perfect formal errors don't make the pull statistic too
     # aggressive.
-    has_err = all('hst_mag_err_gdc' in d['matched'].columns for d in group.values())
+    has_err = all(mag_err_col in d['matched'].columns for d in group.values())
     rows = []
     for name, d in group.items():
         tmp = d['matched'][['gaia_source_id']].copy()
         tmp['mag_norm'] = d['mag_norm']
         tmp['image']    = name
         if has_err:
-            tmp['mag_err'] = d['matched']['hst_mag_err_gdc'].values
+            tmp['mag_err'] = d['matched'][mag_err_col].values
         rows.append(tmp)
     combined = pd.concat(rows, ignore_index=True)
 
@@ -368,13 +393,18 @@ def write_source_quality(data, source_stats, image_stats, mag_scatter_thr):
     return out
 
 
-def write_solo_quality(data):
+def write_solo_quality(data, telescope='HST'):
+    if telescope == 'JWST':
+        stmag_col, legacy_tool = 'jwst_mag_st_gdc', 'jwst1pass'
+    else:
+        stmag_col, legacy_tool = 'hst_mag_st_gdc', 'py1pass'
+
     df = data['matched'].copy()
-    if not has_valid_stmag(data['matched']):
-        print(f"  WARNING: {data['image_name']} missing hst_mag_st_gdc "
-              f"(stale py1pass output?) — solo image skipped")
+    if not has_valid_stmag(data['matched'], telescope=telescope):
+        print(f"  WARNING: {data['image_name']} missing {stmag_col} "
+              f"(stale {legacy_tool} output?) — solo image skipped")
         return None
-    mag_norm = data['matched']['hst_mag_st_gdc'].values.copy()
+    mag_norm = data['matched'][stmag_col].values.copy()
     df['mag_normalized']    = mag_norm
     df['n_same_filter']     = 1
     df['mag_norm_median']   = df['mag_normalized']
@@ -400,11 +430,17 @@ def write_solo_quality(data):
 # Global target-level catalog
 # ---------------------------------------------------------------------------
 
-def build_global_catalog(images, target, data_dir):
+def build_global_catalog(images, target, data_dir, telescope='HST'):
     """
     Aggregate all source_quality.csv files into a single cross_match_catalog.csv
     at the target level.  One row per (gaia_source_id, filter_camera).
     """
+    if telescope == 'JWST':
+        index_col, star_col = 'jwst_index', 'is_star'
+    else:
+        index_col, star_col = 'hst_index', 'hst_is_star'
+    index_list_key = f'{index_col}_list'
+
     rows = []
     for name, d in images.items():
         sq_path = os.path.join(d['image_dir'], 'source_quality.csv')
@@ -413,10 +449,10 @@ def build_global_catalog(images, target, data_dir):
         sq = pd.read_csv(sq_path)
         sq['image_name']    = name
         sq['filter_camera'] = d['filter_camera']
-        cols = ['gaia_source_id', 'hst_index', 'image_name', 'filter_camera',
+        cols = ['gaia_source_id', index_col, 'image_name', 'filter_camera',
                 'mag_normalized', 'mag_norm_mad', 'mag_norm_wmean', 'mag_norm_werr',
                 'n_consistent', 'outlier_images', 'is_trustworthy',
-                'has_gaia_pms', 'gaia_gmag', 'residual_sigma', 'hst_is_star']
+                'has_gaia_pms', 'gaia_gmag', 'residual_sigma', star_col]
         rows.append(sq[[c for c in cols if c in sq.columns]])
 
     if not rows:
@@ -436,8 +472,8 @@ def build_global_catalog(images, target, data_dir):
         out_imgs = g['outlier_images'].dropna().iloc[0] if 'outlier_images' in g and g['outlier_images'].notna().any() else ''
 
         # is_star aggregation across images
-        if 'hst_is_star' in g.columns:
-            star_vals = g['hst_is_star'].astype(bool)
+        if star_col in g.columns:
+            star_vals = g[star_col].astype(bool)
             is_star_all = bool(star_vals.all())
             is_star_any = bool(star_vals.any())
             non_star_imgs = ','.join(sorted(g.loc[~star_vals, 'image_name'].tolist()))
@@ -449,7 +485,7 @@ def build_global_catalog(images, target, data_dir):
         return pd.Series({
             'n_images':              len(g),
             'image_list':            ','.join(g['image_name'].tolist()),
-            'hst_index_list':        ','.join(g['hst_index'].astype(str).tolist()),
+            index_list_key:          ','.join(g[index_col].astype(str).tolist()),
             'mag_norm_wmean':        float(wmean),
             'mag_norm_werr':         float(werr) if not np.isnan(werr) else np.nan,
             'mag_norm_mad':          float(g['mag_norm_mad'].median()),
@@ -481,8 +517,13 @@ def build_global_catalog(images, target, data_dir):
 # ---------------------------------------------------------------------------
 
 def validate_target(target, data_dir, mag_scatter_thr=0.1,
-                    offset_tol_mag=0.05, offset_tol_px=10.0):
-    images = find_processed_images(target, data_dir)
+                    offset_tol_mag=0.05, offset_tol_px=10.0, telescope='HST'):
+    if telescope == 'JWST':
+        stmag_col, legacy_tool = 'jwst_mag_st_gdc', 'jwst1pass'
+    else:
+        stmag_col, legacy_tool = 'hst_mag_st_gdc', 'py1pass'
+
+    images = find_processed_images(target, data_dir, telescope=telescope)
     if not images:
         print(f'No processed images found for {target}'); return
 
@@ -499,18 +540,18 @@ def validate_target(target, data_dir, mag_scatter_thr=0.1,
     all_image_stats = {}
 
     for filt, names in sorted(by_filter.items()):
-        # Drop images without hst_mag_st_gdc before building the graph.
-        missing = [n for n in names if not has_valid_stmag(images[n]['matched'])]
+        # Drop images without a valid stmag column before building the graph.
+        missing = [n for n in names if not has_valid_stmag(images[n]['matched'], telescope=telescope)]
         if missing:
             print(f'\n  [{filt}] WARNING: {len(missing)} image(s) missing '
-                  f'hst_mag_st_gdc (stale py1pass?) — skipped: {missing}')
+                  f'{stmag_col} (stale {legacy_tool}?) — skipped: {missing}')
         valid = [n for n in names if n not in missing]
         if not valid:
             continue
 
         # Pairwise ZPs between all images in this filter that share ≥ 3 sources.
         group_all = {n: images[n] for n in valid}
-        pairwise  = compute_pairwise_zps(group_all)
+        pairwise  = compute_pairwise_zps(group_all, telescope=telescope)
 
         # Connected components: each is an independently calibratable set of images.
         components = find_overlap_components(valid, pairwise)
@@ -523,7 +564,7 @@ def validate_target(target, data_dir, mag_scatter_thr=0.1,
 
             if len(comp) == 1:
                 name = comp_names[0]
-                out  = write_solo_quality(images[name])
+                out  = write_solo_quality(images[name], telescope=telescope)
                 if out is None:
                     continue
                 n_total = len(images[name]['matched'])
@@ -546,7 +587,8 @@ def validate_target(target, data_dir, mag_scatter_thr=0.1,
             group    = {n: images[n] for n in comp}
 
             source_stats, image_stats = validate_filter_group(
-                group, ref_name, zp_dict, mag_scatter_thr, offset_tol_mag, offset_tol_px)
+                group, ref_name, zp_dict, mag_scatter_thr, offset_tol_mag, offset_tol_px,
+                telescope=telescope)
 
             for name in comp_names:
                 out = write_source_quality(images[name], source_stats, image_stats,
@@ -594,7 +636,7 @@ def validate_target(target, data_dir, mag_scatter_thr=0.1,
         print(f'\n  ZP offsets: {len(zp_df)} images → {zp_path}')
 
     # Global catalog
-    out = build_global_catalog(images, target, data_dir)
+    out = build_global_catalog(images, target, data_dir, telescope=telescope)
     if out:
         cat = pd.read_csv(out)
         n_sources = len(cat)
@@ -605,8 +647,10 @@ def validate_target(target, data_dir, mag_scatter_thr=0.1,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Cross-image validation of Gaia-HST cross-matches.')
+        description='Cross-image validation of Gaia-HST/JWST cross-matches.')
     parser.add_argument('--target', required=True)
+    parser.add_argument('--telescope', choices=['HST', 'JWST'], default='HST',
+                        help='Telescope whose cross-matches to validate. Default: HST')
     parser.add_argument('--data-dir', default='./data')
     parser.add_argument('--mag-scatter-threshold', type=float, default=0.1,
                         help='MAD threshold for magnitude consistency flag. Default: 0.1 mag')
@@ -619,4 +663,5 @@ if __name__ == '__main__':
     validate_target(args.target, args.data_dir,
                     mag_scatter_thr=args.mag_scatter_threshold,
                     offset_tol_mag=args.offset_tolerance_mag,
-                    offset_tol_px=args.offset_tolerance_px)
+                    offset_tol_px=args.offset_tolerance_px,
+                    telescope=args.telescope)

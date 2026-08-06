@@ -1,14 +1,17 @@
 """
-Data loader for the new HST pipeline whose outputs live under::
+Data loader for the HST/JWST pipeline whose outputs live under::
 
-    {data_root}/{field_name}/HST/mastDownload/HST/{image_name}/
+    {data_root}/{field_name}/{telescope}/mastDownload/{telescope}/{image_name}/
 
-Expected files per image directory
-------------------------------------
+Expected files per image directory (telescope='HST', default)
+---------------------------------------------------------------
 {img}_flc.fits              HST image (header-only needed; two SCI extensions)
 {img}_flc_catalog.fits      PSF-fit source catalog (positions + covariances)
 transformation.csv          Initial alignment onto the Gaia frame
 matched_gaia.csv            HST↔Gaia cross-match (hst_index ↔ gaia_source_id)
+
+For telescope='JWST', the same files are read with '_cal' in place of '_flc'
+and matched_gaia.csv uses jwst_index instead of hst_index.
 
 Gaia catalog
 ------------
@@ -22,7 +25,7 @@ the rest of the BP3M pipeline (solver, run_bp3m.py, etc.) is unchanged.
 
 Also writes a summary CSV
 -------------------------
-{data_root}/{field_name}/HST/image_transformation_summaries.csv
+{data_root}/{field_name}/{telescope}/image_transformation_summaries.csv
 with one row per usable image, containing all metadata extracted from the
 FITS headers and transformation.csv.  This file mimics the columns expected
 by load_image_data() so the existing loader can read it if needed.
@@ -102,12 +105,13 @@ def _fcm_to_abcdwz(A, B, C, D, xs_o, ys_o, xt_o, yt_o, x_cen, y_cen,
     return np.array([abcd[0], abcd[1], abcd[2], abcd[3], wz[0], wz[1]])
 
 
-def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
+def _read_image_meta(img_dir: Path, img_name: str, telescope: str = 'HST') -> dict | None:
     """
-    Extract all metadata needed by BP3MSolver from the FLC FITS header and
+    Extract all metadata needed by BP3MSolver from the FLC/CAL FITS header and
     transformation.csv.  Returns None if any required file is missing.
     """
-    flc_path  = img_dir / f"{img_name}_flc.fits"
+    image_suffix = '_cal.fits' if telescope == 'JWST' else '_flc.fits'
+    flc_path  = img_dir / f"{img_name}{image_suffix}"
     tran_path = img_dir / "transformation.csv"
 
     if not flc_path.exists() or not tran_path.exists():
@@ -122,9 +126,13 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
         detector   = str(h0.get("DETECTOR", "")).strip()
         filt       = _get_filter(h0)
 
-        # Mid-exposure MJD
-        expstart = float(h0["EXPSTART"])
-        expend   = float(h0["EXPEND"])
+        # Mid-exposure MJD (JWST uses MJD-BEG/MJD-END as fallback)
+        if telescope == 'JWST':
+            expstart = float(h0.get("EXPSTART", h0.get("MJD-BEG", 51544.0)))
+            expend   = float(h0.get("EXPEND",   h0.get("MJD-END", expstart)))
+        else:
+            expstart = float(h0["EXPSTART"])
+            expend   = float(h0["EXPEND"])
         hst_time_mjd = 0.5 * (expstart + expend)
 
         # Pixel scale and rotation from primary SCI extension CD matrix
@@ -193,7 +201,8 @@ def _read_image_meta(img_dir: Path, img_name: str) -> dict | None:
 
 def _build_stars_df(img_dir: Path, img_name: str,
                     gaia_float_to_int64: dict | None = None,
-                    pos_err_floor: float = _MIN_POS_ERR_PX) -> pd.DataFrame | None:
+                    pos_err_floor: float = _MIN_POS_ERR_PX,
+                    telescope: str = 'HST') -> pd.DataFrame | None:
     """
     Build the per-image source DataFrame expected by BP3MSolver.
 
@@ -212,7 +221,8 @@ def _build_stars_df(img_dir: Path, img_name: str,
         the 19-digit integer.  When None, a direct int64 cast is used (safe
         only when the CSV was written with integer formatting).
     """
-    cat_path   = img_dir / f"{img_name}_flc_catalog.fits"
+    cat_suffix = '_cal_catalog.fits' if telescope == 'JWST' else '_flc_catalog.fits'
+    cat_path   = img_dir / f"{img_name}{cat_suffix}"
     match_path = img_dir / "matched_gaia.csv"
 
     if not cat_path.exists() or not match_path.exists():
@@ -235,7 +245,8 @@ def _build_stars_df(img_dir: Path, img_name: str,
     # ── Matched Gaia cross-match ──────────────────────────────────────────────
     match = pd.read_csv(match_path)
 
-    hst_idx = match["hst_index"].to_numpy(int)
+    idx_col = 'jwst_index' if telescope == 'JWST' else 'hst_index'
+    hst_idx = match[idx_col].to_numpy(int)
 
     # Gaia source IDs may have been written as float64 scientific notation in
     # matched_gaia.csv (e.g. "3.88155130191373e+18"), which loses the last ~3
@@ -314,11 +325,12 @@ def _build_stars_df(img_dir: Path, img_name: str,
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def load_image_data_flc(data_root, field_name: str,
-                        pos_err_floor: float = _MIN_POS_ERR_PX):
+                        pos_err_floor: float = _MIN_POS_ERR_PX,
+                        telescope: str = 'HST'):
     """
-    Load BP3M inputs from the new FLC-based pipeline layout.
+    Load BP3M inputs from the new FLC/CAL-based pipeline layout.
 
-    Directory layout expected::
+    Directory layout expected (telescope='HST', default)::
 
         {data_root}/{field_name}/
             HST/mastDownload/HST/
@@ -330,6 +342,9 @@ def load_image_data_flc(data_root, field_name: str,
             Gaia/
                 *_gaia.csv   (same format as the existing pipeline)
 
+    For telescope='JWST', the root is {data_root}/{field_name}/JWST/mastDownload/JWST/
+    and files use '_cal' in place of '_flc'.
+
     Returns
     -------
     images : dict[image_name → dict]
@@ -339,11 +354,12 @@ def load_image_data_flc(data_root, field_name: str,
     """
     data_root  = Path(data_root)
     field_path = data_root / field_name
-    hst_root   = field_path / "HST" / "mastDownload" / "HST"
+    tel_upper  = telescope.upper()
+    hst_root   = field_path / tel_upper / "mastDownload" / tel_upper
     gaia_dir   = field_path / "Gaia"
 
     if not hst_root.exists():
-        raise FileNotFoundError(f"HST image directory not found: {hst_root}")
+        raise FileNotFoundError(f"{telescope} image directory not found: {hst_root}")
 
     # ── Gaia catalog ──────────────────────────────────────────────────────────
     gaia_files = sorted(glob.glob(str(gaia_dir / "*_gaia.csv")))
@@ -400,12 +416,13 @@ def load_image_data_flc(data_root, field_name: str,
     for img_dir in img_dirs:
         img_name = img_dir.name
 
-        meta = _read_image_meta(img_dir, img_name)
+        meta = _read_image_meta(img_dir, img_name, telescope=telescope)
         if meta is None:
             skipped.append(img_name)
             continue
 
-        stars_df = _build_stars_df(img_dir, img_name, gaia_float_to_int64, pos_err_floor)
+        stars_df = _build_stars_df(img_dir, img_name, gaia_float_to_int64, pos_err_floor,
+                                   telescope=telescope)
         if stars_df is None or len(stars_df) == 0:
             skipped.append(img_name)
             continue

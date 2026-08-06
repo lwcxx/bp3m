@@ -32,16 +32,38 @@ from astroquery.mast import Observations
 # Instruments supported per telescope (MAST instrument_name values)
 _INSTRUMENTS = {
     'HST':  ['ACS/WFC', 'WFC3/UVIS', 'ACS/HRC'],
-    'JWST': ['NIRCAM', 'NIRISS'],   # placeholder — extend when py1pass/cross-match support JWST
+    'JWST': ['NIRCAM', 'NIRISS', 'MIRI'],
 }
 
 # Map MAST instrument_name → STDPSFs/STDGDCs subdirectory name
+# NIRCam uses mixed-case 'NIRCam' on disk to match the STScI directory naming.
 _INST_TO_LIBDIR = {
     'ACS/WFC':   'ACSWFC',
     'WFC3/UVIS': 'WFC3UV',
     'ACS/HRC':   'ACSHRC',
-    'NIRCAM':    'NIRCAM',
+    'NIRCAM':    'NIRCam',
     'NIRISS':    'NIRISS',
+    'MIRI':      'MIRI',
+}
+
+# Map NIRCam detector names → library channel subdirectory (LWC or SWC).
+# Keys cover both uppercase (FITS DETECTOR keyword) and lowercase (filename suffix).
+# LWC: FITS uses NRCALONG/NRCBLONG; PSF library abbreviates these as NRCAL/NRCBL.
+# SWC: FITS uses NRCA1–NRCA4 / NRCB1–NRCB4; filenames use the same in lowercase.
+_NIRCAM_DETECTOR_TO_CHANNEL: dict[str, str] = {
+    'nrca1': 'SWC', 'nrca2': 'SWC', 'nrca3': 'SWC', 'nrca4': 'SWC',
+    'nrcb1': 'SWC', 'nrcb2': 'SWC', 'nrcb3': 'SWC', 'nrcb4': 'SWC',
+    'NRCA1': 'SWC', 'NRCA2': 'SWC', 'NRCA3': 'SWC', 'NRCA4': 'SWC',
+    'NRCB1': 'SWC', 'NRCB2': 'SWC', 'NRCB3': 'SWC', 'NRCB4': 'SWC',
+    'nrcalong': 'LWC', 'nrcblong': 'LWC',
+    'NRCALONG': 'LWC', 'NRCBLONG': 'LWC',
+}
+
+# LWC detector names are abbreviated in PSF/GDC filenames (NRCALONG → NRCAL).
+# SWC detector names are unchanged, so .get(det, det.upper()) handles both cases.
+_NIRCAM_LWC_LIBNAME: dict[str, str] = {
+    'NRCALONG': 'NRCAL', 'nrcalong': 'NRCAL',
+    'NRCBLONG': 'NRCBL', 'nrcblong': 'NRCBL',
 }
 
 # Default Gaia DR3 reference epoch as MJD (2017-05-28)
@@ -58,17 +80,23 @@ def _normalise_filter(name: str) -> str:
     return _PSF_FILTER_NORM.get(name, name)
 
 
-def _clean_mast_filter(raw: str) -> str:
-    """Return the science filter from a MAST filter string, dropping CLEAR entries.
+def _clean_mast_filter(raw: str, telescope: str = 'HST') -> str:
+    """Return the science filter from a MAST filter string.
 
-    MAST returns paired-filter strings like 'F814W;CLEAR1L' or 'CLEAR2L;F606W'.
-    We split on ';', drop any token that is empty or starts with 'CLEAR', and
-    return the first remaining token.  Falls back to the raw string if nothing
-    survives the filter.
+    MAST returns paired-filter strings separated by ';'. We split on ';', drop
+    any token that is empty or starts with 'CLEAR', and return one of the
+    remaining tokens. Falls back to the raw string if nothing survives.
+
+    HST: paired strings like 'F814W;CLEAR1L' or 'CLEAR2L;F606W' — return the
+    first remaining (science) token.
+    JWST: paired strings like 'F277W;CLEAR' (drop CLEAR) or 'F150W;F150W2'
+    (two science filters — pupil + filter wheel) — return the last token.
     """
     tokens = [t.strip() for t in raw.split(';')]
     science = [t for t in tokens if t and not t.upper().startswith('CLEAR')]
-    return science[0] if science else raw.strip()
+    if not science:
+        return raw.strip()
+    return science[-1] if telescope == 'JWST' else science[0]
 
 
 def _query_params_sidecar(hst_dir: Path, field_name: str) -> Path:
@@ -101,9 +129,33 @@ def _make_query_params(
     }
 
 
+def _nircam_filters(nircam_dir: Path, prefix: str) -> set[str]:
+    """Collect filter names from NIRCam's two-level LWC/SWC library structure.
+
+    NIRCam/LWC/ — files are flat: {prefix}_NRC{A|B}L_{filter}.fits
+    NIRCam/SWC/ — one subdir per filter: SWC/{filter}/{prefix}_NRC{A|B}{1-4}_{filter}.fits
+    """
+    filters: set[str] = set()
+
+    lwc_dir = nircam_dir / 'LWC'
+    if lwc_dir.exists():
+        for f in lwc_dir.glob(f'{prefix}_*.fits'):
+            parts = f.stem.split('_')
+            if len(parts) >= 3:
+                filters.add(_normalise_filter(parts[2]))
+
+    swc_dir = nircam_dir / 'SWC'
+    if swc_dir.exists():
+        for filt_dir in sorted(swc_dir.iterdir()):
+            if filt_dir.is_dir() and any(filt_dir.glob(f'{prefix}_*.fits')):
+                filters.add(filt_dir.name)
+
+    return filters
+
+
 def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
     """
-    Scan a GaiaHub lib/ directory to find instrument+filter combinations that
+    Scan a lib/ directory to find instrument+filter combinations that
     have BOTH a STDPSF and a STDGDC file.
 
     Parameters
@@ -130,7 +182,7 @@ def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
     for psf_sub in sorted(psf_root.iterdir()):
         if not psf_sub.is_dir():
             continue
-        det = psf_sub.name                              # e.g. 'ACSWFC'
+        det = psf_sub.name                              # e.g. 'ACSWFC', 'NIRCam'
         inst = libdir_to_inst.get(det)
         if inst is None:
             continue
@@ -139,22 +191,27 @@ def get_available_psf_gdc_combos(lib_dir: str | Path) -> dict[str, set[str]]:
         if not gdc_sub.exists():
             continue
 
-        # Collect filters with a PSF file (ignore _SM3/_SM4 variants and 'vintage')
-        psf_filters: set[str] = set()
-        for f in psf_sub.glob("STDPSF_*.fits"):
-            parts = f.stem.split('_')
-            # STDPSF_ACSWFC_F814W, STDPSF_ACSWFC_F814W_SM4, STDPSF_ACSWFC_F850L_SM3
-            # SM-suffixed files are valid PSFs (e.g. F850L only exists as SM3).
-            # Using a set means multiple variants for the same filter don't double-count.
-            if len(parts) >= 3 and parts[-1] != 'vintage':
-                psf_filters.add(_normalise_filter(parts[2]))
+        if det == 'NIRCam':
+            # NIRCam has a two-level structure: LWC/ (flat files) and SWC/ (per-filter subdirs)
+            psf_filters = _nircam_filters(psf_sub, 'STDPSF')
+            gdc_filters = _nircam_filters(gdc_sub, 'STDGDC')
+        else:
+            # Collect filters with a PSF file (ignore _SM3/_SM4 variants and 'vintage')
+            psf_filters: set[str] = set()
+            for f in psf_sub.glob("STDPSF_*.fits"):
+                parts = f.stem.split('_')
+                # STDPSF_ACSWFC_F814W, STDPSF_ACSWFC_F814W_SM4, STDPSF_ACSWFC_F850L_SM3
+                # SM-suffixed files are valid PSFs (e.g. F850L only exists as SM3).
+                # Using a set means multiple variants for the same filter don't double-count.
+                if len(parts) >= 3 and parts[-1] != 'vintage':
+                    psf_filters.add(_normalise_filter(parts[2]))
 
-        # Collect filters with a GDC file
-        gdc_filters: set[str] = set()
-        for f in gdc_sub.glob("STDGDC_*.fits"):
-            parts = f.stem.split('_')
-            if len(parts) >= 3 and 'OFFICIAL' not in parts and 'JFRAME' not in parts:
-                gdc_filters.add(_normalise_filter(parts[2]))
+            # Collect filters with a GDC file
+            gdc_filters: set[str] = set()
+            for f in gdc_sub.glob("STDGDC_*.fits"):
+                parts = f.stem.split('_')
+                if len(parts) >= 3 and 'OFFICIAL' not in parts and 'JFRAME' not in parts:
+                    gdc_filters.add(_normalise_filter(parts[2]))
 
         common = psf_filters & gdc_filters
         if common:
@@ -176,7 +233,7 @@ def search_mast(
     date_second_epoch_mjd: float = _GAIA_DR3_MJD,
     obs_date_min: str | None = None,
     obs_date_max: str | None = None,
-    im_type: str = '_flc',
+    im_type: str | None = None,
     telescope: str = 'HST',
     instruments: list[str] | None = None,
     available_combos: dict[str, set[str]] | None = None,
@@ -186,8 +243,9 @@ def search_mast(
 
     Parameters
     ----------
-    time_baseline_days: minimum HST–Gaia time baseline in days. None means no
-                        minimum (all images up to date_second_epoch_mjd are kept).
+    time_baseline_days: minimum telescope–Gaia time baseline in days. None means no
+                        minimum (HST: all images up to date_second_epoch_mjd are kept;
+                        JWST: all images from date_second_epoch_mjd onward are kept).
     obs_date_min    : earliest observation date to include (ISO string, e.g. '2005-01-01').
                       None means no lower bound.
     obs_date_max    : latest observation date to include (ISO string). None means no upper bound.
@@ -201,6 +259,9 @@ def search_mast(
     obs_table          : one row per observation set (with i_exptime, t_baseline)
     data_products_table: one row per image file (with URI, parent_obsid, …)
     """
+    if im_type is None:
+        im_type = '_cal' if telescope == 'JWST' else '_flc'
+
     allowed_inst = _INSTRUMENTS.get(telescope.upper())
     if allowed_inst is None:
         raise ValueError(f"Unsupported telescope '{telescope}'. "
@@ -229,30 +290,48 @@ def search_mast(
                                               for i in allowed_inst
                                               if i in available_combos]) or set())
         if not hst_filters:
-            hst_filters = ['F435W', 'F475W', 'F555W', 'F606W',
-                           'F625W', 'F658N', 'F775W', 'F814W', 'F850LP']
+            if telescope == 'JWST':
+                hst_filters = ['F090W', 'F115W', 'F140M', 'F150W', 'F158M', 'F200W', 'F277W',
+                               'F356W', 'F380M', 'F430M', 'F444W', 'F480W', 'F560W', 'F770W', 'F1000W']
+            else:
+                hst_filters = ['F435W', 'F475W', 'F555W', 'F606W',
+                               'F625W', 'F658N', 'F775W', 'F814W', 'F850LP']
     if project is None:
         project = [telescope]
 
-    # Shrink box slightly to avoid edge artefacts (GaiaHub convention)
+    # Shrink (HST) / grow (JWST) box slightly to avoid edge artefacts
     cos_dec = np.cos(np.deg2rad(dec))
     margin_ra  = 0.056 / cos_dec
     margin_dec = 0.056
-    ra1  = ra  - search_width  / 2 + margin_ra
-    ra2  = ra  + search_width  / 2 - margin_ra
-    dec1 = dec - search_height / 2 + margin_dec
-    dec2 = dec + search_height / 2 - margin_dec
-
-    # When time_baseline_days is None, keep all images up to the Gaia epoch
-    if time_baseline_days is not None:
-        t_max_mjd = _GAIA_DR3_MJD - time_baseline_days
+    if telescope == 'JWST':
+        ra1  = ra  - search_width  / 2 - margin_ra
+        ra2  = ra  + search_width  / 2 + margin_ra
+        dec1 = dec - search_height / 2 - margin_dec
+        dec2 = dec + search_height / 2 + margin_dec
     else:
-        t_max_mjd = (Time.now()-366*u.day).mjd
+        ra1  = ra  - search_width  / 2 + margin_ra
+        ra2  = ra  + search_width  / 2 - margin_ra
+        dec1 = dec - search_height / 2 + margin_dec
+        dec2 = dec + search_height / 2 - margin_dec
 
-    # Build MAST time bounds
+    # Build MAST time bounds.
+    # HST predates the Gaia DR3 epoch, so when time_baseline_days is None all
+    # images up to the Gaia epoch are kept, and t_max_mjd is pushed earlier by
+    # time_baseline_days when given. JWST postdates Gaia DR3, so all JWST
+    # images up to "now" are kept, and time_baseline_days instead raises the
+    # minimum obs date.
     t_min_bound = 0
     if obs_date_min is not None:
         t_min_bound = Time(obs_date_min).mjd
+    if telescope == 'JWST':
+        t_max_mjd = Time.now().mjd
+        if time_baseline_days is not None:
+            t_min_bound = max(t_min_bound, _GAIA_DR3_MJD + time_baseline_days)
+    else:
+        if time_baseline_days is not None:
+            t_max_mjd = _GAIA_DR3_MJD - time_baseline_days
+        else:
+            t_max_mjd = (Time.now()-366*u.day).mjd
 
     print(f"  Querying MAST (this can take a minute)...")
     import time as _time
@@ -297,15 +376,22 @@ def search_mast(
             else:
                 raise
     im_sub   = im_type[1:].upper()   # '_flc' → 'FLC'
-    mask = (
-        ((prod_raw['productSubGroupDescription'] == im_sub) |
-         (prod_raw['productSubGroupDescription'] == 'DRZ')) &
-        (prod_raw['obs_collection'] == telescope)
-    )
+    if telescope == 'JWST':
+        # JWST has no DRZ-equivalent product at the FLC level.
+        mask = (
+            (prod_raw['productSubGroupDescription'] == im_sub) &
+            (prod_raw['obs_collection'] == telescope)
+        )
+    else:
+        mask = (
+            ((prod_raw['productSubGroupDescription'] == im_sub) |
+             (prod_raw['productSubGroupDescription'] == 'DRZ')) &
+            (prod_raw['obs_collection'] == telescope)
+        )
     prod_df = prod_raw[mask].to_pandas()
     obs_df  = obs_raw.to_pandas()
 
-    # Drop HAP pipeline products
+    # Drop HAP pipeline products. Note: JWST does not have HAP products.
     prod_df = prod_df[~prod_df['project'].str.contains('HAP', na=False)]
 
     # Count exposures per observation to compute individual exposure time
@@ -321,9 +407,13 @@ def search_mast(
     obs_time = Time(obs_df['t_max'].values, format='mjd')
     obs_time.format = 'iso'; obs_time.out_subfmt = 'date'
     obs_df['obs_time']   = obs_time.value
-    obs_df['t_baseline'] = np.round(
-        (date_second_epoch_mjd - obs_df['t_max'].values) / 365.2422, 2)
-    obs_df['filters'] = obs_df['filters'].apply(_clean_mast_filter)
+    if telescope == 'JWST':
+        obs_df['t_baseline'] = np.round(
+            -(date_second_epoch_mjd - obs_df['t_max'].values) / 365.2422, 2)
+    else:
+        obs_df['t_baseline'] = np.round(
+            (date_second_epoch_mjd - obs_df['t_max'].values) / 365.2422, 2)
+    obs_df['filters'] = obs_df['filters'].apply(lambda f: _clean_mast_filter(f, telescope=telescope))
 
     # Merge exposure-time info into products table
     meta = obs_df[['obsid', 'i_exptime', 'filters', 't_baseline', 's_ra', 's_dec']]
@@ -356,6 +446,8 @@ def search_mast(
     if available_combos:
         def _combo_ok(row):
             inst_name = row.get('instrument_name', '')
+            if telescope == 'JWST':
+                inst_name = inst_name.split('/')[0]  # 'NIRCAM/IMAGE' → 'NIRCAM'
             filt_name = row.get('filters', '')
             if inst_name not in available_combos:
                 return False
@@ -393,7 +485,7 @@ def download_hst_images(
     date_second_epoch_mjd: float = _GAIA_DR3_MJD,
     obs_date_min: str | None = None,
     obs_date_max: str | None = None,
-    im_type: str = '_flc',
+    im_type: str | None = None,
     telescope: str = 'HST',
     instruments: list[str] | None = None,
     lib_dir: str | Path | None = None,
@@ -424,6 +516,8 @@ def download_hst_images(
     -------
     obs_table, data_products_table  (both pd.DataFrame)
     """
+    if im_type is None:
+        im_type = '_cal' if telescope == 'JWST' else '_flc'
     tel_upper  = telescope.upper()
     hst_dir    = Path(output_dir) / field_name / tel_upper
     hst_dir.mkdir(parents=True, exist_ok=True)
@@ -521,7 +615,8 @@ def download_hst_images(
                         gaia_df=gaia_df, field_name=field_name,
                         ra=ra, dec=dec,
                         search_width=search_width,
-                        search_height=search_height)
+                        search_height=search_height,
+                        telescope=telescope)
     except Exception as _e:
         print(f"  WARNING: footprint plot failed — {_e}")
 
@@ -558,11 +653,11 @@ def download_hst_images(
             obs_df  = obs_df[obs_df['obsid'].astype(str).isin(selected_obsids)]
             prod_df = prod_df[prod_df['parent_obsid'].isin(selected_obsids)]
 
-    # Download FLC products only
+    # Download image products only
     flc_sub = im_type[1:].upper()
     to_dl   = prod_df[prod_df['productSubGroupDescription'] == flc_sub].copy()
     if to_dl.empty:
-        print("  No FLC products to download.")
+        print(f"  No {im_type} products to download.")
         return obs_df, prod_df
 
     # Skip already-downloaded files unless force_redownload
@@ -606,7 +701,7 @@ def download_hst_images(
 
             # Failed-observation check: EXPTIME=0 means no real sky data collected.
             # Keep the file on disk but exclude from downstream processing.
-            fail_reason = _check_exptime(dest)
+            fail_reason = _check_exptime(dest, telescope=telescope)
             if fail_reason:
                 print(f"  WARNING: {fname} is a failed observation ({fail_reason}) — "
                       f"skipping all downstream steps.")
@@ -673,7 +768,7 @@ def download_hst_images(
             dest = mast_root_nd / obs_id / fname
             if not dest.exists():
                 continue
-            fail_reason = _check_exptime(dest)
+            fail_reason = _check_exptime(dest, telescope=telescope)
             if fail_reason:
                 print(f"  WARNING: {fname} is a failed observation ({fail_reason}) — "
                       f"skipping all downstream steps.")
@@ -689,6 +784,7 @@ def download_hst_images(
 
 # Filter → display colour mapping (approximate true-colour ordering)
 _FILTER_COLORS = {
+    # HST
     'F220W': '#9b59b6', 'F225W': '#8e44ad', 'F275W': '#6c3483',
     'F330W': '#4a235a', 'F336W': '#7d3c98', 'F350LP': '#aab7b8',
     'F390M': '#2471a3', 'F390W': '#2e86c1', 'F435W': '#1a5276',
@@ -698,6 +794,24 @@ _FILTER_COLORS = {
     'F621M': '#e67e22', 'F625W': '#d35400', 'F658N': '#cb4335',
     'F660N': '#c0392b', 'F775W': '#e74c3c', 'F814W': '#922b21',
     'F850LP': '#641e16', 'F850L': '#641e16',
+    # JWST NIRCam short wavelength (0.9–2.0 μm) — dark reds → purples
+    'F090W':  '#922b21',
+    'F115W':  '#7b241c',
+    'F140W':  '#5b2c6f',
+    'F150W':  '#6c3483',
+    'F158W':  '#7d3c98',
+    'F200W':  '#4a235a',
+    # JWST NIRCam long wavelength (2.7–4.8 μm) — navy → blue → teal → green → gold
+    'F277W':  '#154360',
+    'F356W':  '#1a5276',
+    'F380W':  '#1f618d',
+    'F430W':  '#148f77',
+    'F444W':  '#1e8449',
+    'F480W':  '#d4ac0d',
+    # JWST MIRI (5.6–10 μm) — orange → red
+    'F560W':  '#e67e22',
+    'F770W':  '#d35400',
+    'F1000W': '#c0392b',
 }
 _DEFAULT_COLOR = '#95a5a6'
 
@@ -711,9 +825,10 @@ def plot_footprints(
     dec: float | None = None,
     search_width: float | None = None,
     search_height: float | None = None,
+    telescope: str = 'HST',
 ) -> None:
     """
-    Plot HST image footprints on the sky with Gaia stars in the background.
+    Plot HST/JWST image footprints on the sky with Gaia stars in the background.
 
     Footprints are coloured by filter, labelled with their field_id, and
     a legend shows which filter maps to which colour.  Saves a PNG to
@@ -728,9 +843,10 @@ def plot_footprints(
     field_name    : used in the figure title.
     ra, dec       : field centre (degrees).  When provided together with
                     search_width / search_height, the axes are fixed to the
-                    user-specified search box, preventing wildly-offset HST
-                    WCS entries from zooming the plot out.
+                    user-specified search box, preventing wildly-offset WCS
+                    entries from zooming the plot out.
     search_width, search_height : search box full-width in degrees.
+    telescope     : used in the figure title.
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -864,7 +980,7 @@ def plot_footprints(
 
     ax.set_xlabel('R.A. (deg)')
     ax.set_ylabel('Dec. (deg)')
-    title = f'{field_name} — HST footprints' if field_name else 'HST footprints'
+    title = f'{field_name} — {telescope} footprints' if field_name else f'{telescope} footprints'
     ax.set_title(title, fontsize=12)
 
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
@@ -899,10 +1015,10 @@ def _parse_polygons(s_region: str) -> list[np.ndarray]:
 def find_flc_images(output_dir: Path, field_name: str,
                     telescope: str = 'HST', im_type: str = '_flc') -> list[Path]:
     """
-    Return sorted list of downloaded FLC FITS paths for a field.
+    Return sorted list of downloaded FLC (HST) or _cal (JWST) FITS paths for a field.
 
     Expected structure:
-        {output_dir}/{field}/{telescope}/mastDownload/{telescope}/{obs_id}/{obs_id}_flc.fits
+        {output_dir}/{field}/{telescope}/mastDownload/{telescope}/{obs_id}/{obs_id}{im_type}.fits
     """
     root = Path(output_dir) / field_name / telescope.upper() / "mastDownload" / telescope.upper()
     suffix = f"{im_type}.fits"
@@ -952,7 +1068,7 @@ def _count_gaia_in_footprints(obs_df: pd.DataFrame,
 
 
 def _invalidate_psf_cache(flc_path: Path) -> None:
-    """Delete PSF and cross-match caches for a given FLC path, if they exist."""
+    """Delete PSF and cross-match caches for a given FLC/CAL path, if they exist."""
     for p in (flc_path.parent / f"{flc_path.stem}_catalog.fits",
               flc_path.parent / "psf_params.json",
               flc_path.parent / "matched_gaia.csv",
@@ -961,10 +1077,10 @@ def _invalidate_psf_cache(flc_path: Path) -> None:
             p.unlink()
 
 
-def _check_exptime(flc_path: Path) -> str | None:
-    """Return a failure reason string if the FLC file is a failed observation, else None.
+def _check_exptime(flc_path: Path, telescope: str = 'HST') -> str | None:
+    """Return a failure reason string if the image is a failed observation, else None.
 
-    Checks three conditions in priority order (file is kept on disk in all cases):
+    HST — checks three conditions in priority order (file is kept on disk in all cases):
     1. EXPTIME == 0 — shutter open but no real sky signal (e.g. EXCESSIVE DOWNTIME).
     2. EXPFLAG != 'NORMAL' — any non-nominal exposure flag indicates compromised data.
        Known values seen in practice:
@@ -975,8 +1091,34 @@ def _check_exptime(flc_path: Path) -> str | None:
     3. No HDRLET extensions — image was not fully processed by the HST calibration
        pipeline (drizzle/astrodrizzle did not apply WCS corrections). These images
        have less trustworthy astrometry and tend to produce poor cross-matches.
+
+    JWST — checks four conditions in priority order:
+    1. EFFEXPTM == 0   — no effective exposure time; no real sky signal collected.
+    2. ENG_QUAL != 'OK' — guide-star or engineering problem during the exposure.
+    3. DATAPROB == True — pipeline detected a data problem.
+    4. VISITSTA != 'SUCCESSFUL' — visit did not complete successfully.
     """
     from astropy.io import fits
+    if telescope == 'JWST':
+        try:
+            with fits.open(flc_path, memmap=False) as hdul:
+                h = hdul[0].header
+                effexptm = h.get('EFFEXPTM', None)
+                eng_qual = h.get('ENG_QUAL', '').strip()
+                dataprob = h.get('DATAPROB', False)
+                visitsta = h.get('VISITSTA', '').strip()
+            if effexptm is not None and float(effexptm) == 0.0:
+                return "EFFEXPTM=0.0"
+            if eng_qual and eng_qual != 'OK':
+                return f"ENG_QUAL='{eng_qual}'"
+            if dataprob:
+                return "DATAPROB=True"
+            if visitsta and visitsta != 'SUCCESSFUL':
+                return f"VISITSTA='{visitsta}'"
+        except Exception:
+            pass
+        return None
+
     try:
         with fits.open(flc_path, memmap=False) as hdul:
             exptime = hdul[0].header.get('EXPTIME', None)

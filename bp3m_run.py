@@ -19,15 +19,15 @@ Usage examples
 Pipeline steps
 --------------
   1  download_gaia    Download Gaia DR3 catalogue
-  2  download_hst     Search MAST and download HST FLC images
-  3  psf_fitting      PSF-fit each FLC image (py1pass)
-  4  cross_match      Cross-match HST ↔ Gaia (fast_cross_match)
+  2  download_hst     Search MAST and download HST FLC / JWST cal images
+  3  psf_fitting      PSF-fit each image (pypass for HST, jwst1pass for JWST)
+  4  cross_match      Cross-match HST/JWST ↔ Gaia (fast_cross_match)
   5  alignment        Bayesian alignment + proper motions (BP3M)
 
 Extension note
 --------------
-JWST support is planned. Pass --telescope JWST once py1pass and
-fast_cross_match have been updated for JWST data.
+Pass --telescope JWST to run the pipeline on JWST cal.fits images instead
+of HST flc.fits images; every pipeline module dispatches on this flag.
 """
 from __future__ import annotations
 import argparse
@@ -99,7 +99,7 @@ def _parse_args():
     # ── HST/JWST ───────────────────────────────────────────────────────────────────
     h = p.add_argument_group('HST / telescope options')
     h.add_argument('--telescope', type=str, default='HST',
-                   help='Telescope (default HST; JWST planned)')
+                   help='Telescope (default HST; JWST supported)')
     h.add_argument('--hst_filters', type=str, nargs='+', default=None,
                    help='Required filters, e.g. F814W F606W F850LP '
                         '(default: all filters with PSF+GDC in lib_dir). '
@@ -482,7 +482,6 @@ def main():
     # ── Step 2: Download HST/JWST ─────────────────────────────────────────────────
     if not args.skip_download:
         from bp3m.pipeline.download_hst import download_hst_images
-        from bp3m.pipeline.download_jwst import download_jwst_images
         # Load Gaia catalog for footprint star counts if not already in memory
         if gaia_df is None:
             from bp3m.pipeline.explore_utils import load_gaia_catalog
@@ -498,46 +497,25 @@ def main():
                 _gaia_csv = _candidates[0] if _candidates else _gaia_csv
             if _gaia_csv.exists():
                 gaia_df = load_gaia_catalog(_gaia_csv)
-        if args.telescope == 'HST':
-            download_hst_images(
-                ra=args.ra, dec=args.dec,
-                search_width=args.search_width, search_height=args.search_height,
-                output_dir=output_dir, field_name=field,
-                hst_filters=args.hst_filters,
-                t_exptime_min=args.hst_exptime_min,
-                t_exptime_max=args.hst_exptime_max,
-                time_baseline_days=args.time_baseline,
-                obs_date_min=args.obs_date_min,
-                obs_date_max=args.obs_date_max,
-                im_type=args.hst_im_type,
-                telescope=args.telescope,
-                instruments=args.instruments,
-                lib_dir=Path(args.lib_dir),
-                gaia_df=gaia_df,
-                field_ids=_parse_field_ids(args.field_ids),
-                quiet=args.quiet,
-                force_redownload=args.force_redownload_hst,
-            )
-        if args.telescope == 'JWST':
-            download_jwst_images(
-                ra=args.ra, dec=args.dec,
-                search_width=args.search_width, search_height=args.search_height,
-                output_dir=output_dir, field_name=field,
-                hst_filters=args.hst_filters,
-                t_exptime_min=args.hst_exptime_min,
-                t_exptime_max=args.hst_exptime_max,
-                time_baseline_days=args.time_baseline,
-                obs_date_min=args.obs_date_min,
-                obs_date_max=args.obs_date_max,
-                im_type=args.jwst_im_type,
-                telescope=args.telescope,
-                instruments=args.instruments,
-                lib_dir=Path(args.lib_dir),
-                gaia_df=gaia_df,
-                field_ids=_parse_field_ids(args.field_ids),
-                quiet=args.quiet,
-                force_redownload=args.force_redownload_hst,
-            )
+        download_hst_images(
+            ra=args.ra, dec=args.dec,
+            search_width=args.search_width, search_height=args.search_height,
+            output_dir=output_dir, field_name=field,
+            hst_filters=args.hst_filters,
+            t_exptime_min=args.hst_exptime_min,
+            t_exptime_max=args.hst_exptime_max,
+            time_baseline_days=args.time_baseline,
+            obs_date_min=args.obs_date_min,
+            obs_date_max=args.obs_date_max,
+            im_type=_im_type,
+            telescope=args.telescope,
+            instruments=args.instruments,
+            lib_dir=Path(args.lib_dir),
+            gaia_df=gaia_df,
+            field_ids=_parse_field_ids(args.field_ids),
+            quiet=args.quiet,
+            force_redownload=args.force_redownload_hst,
+        )
 
     # Read manifest of selected obsids written by step 2 (persists across runs)
     import json as _json
@@ -554,21 +532,14 @@ def main():
     # run and the failed-obs check has never been written), scan on-disk FLC
     # files now so downstream steps never accidentally process bad images.
     if not _failed_manifest.exists() and _manifest.exists() and _selected_obsids:
-        if args.telescope.upper() == 'HST':
+        if args.telescope.upper() in ('HST', 'JWST'):
             from bp3m.pipeline.download_hst import _check_exptime as _cet
-            im_type = args.hst_im_type
-        elif args.telescope.upper() == 'JWST':
-            from bp3m.pipeline.download_jwst import _check_exptime as _cet
-            im_type = args.jwst_im_type
-        else:
-            _cet = None
-        if _cet is not None:
             _mast_root = _hst_dir / "mastDownload" / args.telescope.upper()
             _scanned_failed: dict[str, str] = {}
             for _oid in list(_selected_obsids):
-                _flc = _mast_root / _oid / f"{_oid}_{im_type.lstrip('_')}.fits"
+                _flc = _mast_root / _oid / f"{_oid}_{_im_type.lstrip('_')}.fits"
                 if _flc.exists():
-                    _reason = _cet(_flc)
+                    _reason = _cet(_flc, telescope=args.telescope.upper())
                     if _reason:
                         _scanned_failed[_oid] = _reason
             if _scanned_failed:
@@ -668,10 +639,7 @@ def main():
 
     # ── Step 3: PSF fitting ───────────────────────────────────────────────────
     if not args.skip_psf:
-        if args.telescope.upper() == 'JWST':
-            from bp3m.pipeline.psf_fitting_cal import run_psf_fitting
-        else:
-            from bp3m.pipeline.psf_fitting import run_psf_fitting
+        from bp3m.pipeline.psf_fitting import run_psf_fitting
         run_psf_fitting(
             output_dir=output_dir, field_name=field,
             lib_dir=Path(args.lib_dir),
@@ -692,10 +660,7 @@ def main():
         )
 
     if args.reclassify_stars:
-        if args.telescope.upper() == 'JWST':
-            from bp3m.pipeline.psf_fitting_cal import reclassify_psf_catalogs
-        else:
-            from bp3m.pipeline.psf_fitting import reclassify_psf_catalogs
+        from bp3m.pipeline.psf_fitting import reclassify_psf_catalogs
         reclassify_psf_catalogs(
             output_dir=output_dir, field_name=field,
             telescope=args.telescope,
@@ -708,10 +673,7 @@ def main():
         )
 
     if args.remeasure_psf_perturbation:
-        if args.telescope.upper() == 'JWST':
-            from bp3m.pipeline.psf_fitting_cal import remeasure_psf_perturbation
-        else:
-            from bp3m.pipeline.psf_fitting import remeasure_psf_perturbation
+        from bp3m.pipeline.psf_fitting import remeasure_psf_perturbation
         remeasure_psf_perturbation(
             output_dir=output_dir, field_name=field,
             lib_dir=Path(args.lib_dir),
@@ -723,10 +685,7 @@ def main():
 
     # ── Step 4: Cross-matching ────────────────────────────────────────────────
     if not args.skip_crossmatch:
-        if args.telescope.upper() == 'JWST':
-            from bp3m.pipeline.cross_match_jwst import run_cross_match
-        else:
-            from bp3m.pipeline.cross_match import run_cross_match
+        from bp3m.pipeline.cross_match import run_cross_match
         run_cross_match(
             output_dir=output_dir, field_name=field,
             telescope=args.telescope,
@@ -748,10 +707,7 @@ def main():
     _inflate_errors_syn = not args.no_inflate_hst_errors
 
     if args.test_synthetic:
-        if args.telescope.upper() == 'JWST':
-            from bp3m.pipeline.synthetic_jwst import generate_synthetic_data, compare_synthetic_results
-        else:
-            from bp3m.pipeline.synthetic import generate_synthetic_data, compare_synthetic_results
+        from bp3m.pipeline.synthetic import generate_synthetic_data, compare_synthetic_results
 
         # Build a unique subdirectory name so different configurations don't
         # overwrite each other (e.g. 'synthetic_only5p_seed43').
@@ -798,10 +754,7 @@ def main():
 
     # ── Step 5: Bayesian alignment ────────────────────────────────────────────
     if not args.skip_alignment:
-        if args.telescope.upper() == 'JWST':
-            from bp3m.pipeline.run_alignment_jwst import run_alignment
-        else:
-            from bp3m.pipeline.run_alignment import run_alignment
+        from bp3m.pipeline.run_alignment import run_alignment
 
         if args.test_synthetic:
             # Run BP3M on the synthetic directory tree.
@@ -818,6 +771,7 @@ def main():
                 mcmc_posteriors=args.mcmc_posteriors,
                 clip_sigma=args.bp3m_clip_sigma,
                 poly_order=args.poly_order,
+                telescope=args.telescope,
                 split_ccd=_split_ccd_syn,
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 inflate_hst_errors=_inflate_errors_syn,
@@ -841,10 +795,7 @@ def main():
             print("\n" + "=" * 55)
             print("Synthetic test — comparing results to truth")
             print("=" * 55)
-            if args.telescope.upper() == 'JWST':
-                from bp3m.pipeline.synthetic_jwst import compare_synthetic_results, run_conditional_solve
-            else:
-                from bp3m.pipeline.synthetic import compare_synthetic_results, run_conditional_solve
+            from bp3m.pipeline.synthetic import compare_synthetic_results, run_conditional_solve
             compare_synthetic_results(
                 output_dir=output_dir,
                 field_name=field,
@@ -858,6 +809,7 @@ def main():
                 output_dir=output_dir,
                 field_name=field,
                 syn_name=syn_name,
+                telescope=args.telescope,
                 split_ccd=_split_ccd_syn,
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 poly_order=args.poly_order,
@@ -871,6 +823,7 @@ def main():
                 mcmc_posteriors=args.mcmc_posteriors,
                 clip_sigma=args.bp3m_clip_sigma,
                 poly_order=args.poly_order,
+                telescope=args.telescope,
                 split_ccd=False if _is_jwst else not args.no_split_ccd,
                 min_stars_split_ccd=args.min_stars_split_ccd,
                 inflate_hst_errors=not args.no_inflate_hst_errors,

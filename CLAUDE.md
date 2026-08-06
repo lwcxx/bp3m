@@ -44,14 +44,24 @@ The repo is a single Python package (`bp3m`) plus two bundled subpackages (`pypa
 
 ### Pipeline flow (bp3m_run.py → bp3m/pipeline/)
 
-| Step | Module (HST) | Module (JWST) | What it does |
-|------|-------------|--------------|--------------|
-| 1 | `download_gaia.py` | same | TAP query to Gaia DR3; caches as CSV |
-| 2 | `download_hst.py` | `download_jwst.py` | MAST search + download; dispatched by `--telescope` |
-| 3 | `psf_fitting.py` | `psf_fitting_cal.py` | Parallelises PSF fitting over images via multiprocessing |
-| 4 | `cross_match.py` | `cross_match_jwst.py` | Parallelises `gaia_cross_match` over images |
-| 5 | `run_alignment.py` | `run_alignment_jwst.py` | Calls `BP3MSolver` from `bp3m/solver.py` |
-| 5a | `synthetic.py` | `synthetic_jwst.py` | Optional: generate synthetic observations + pull tests |
+As of August 2026, every HST/JWST module pair in the pipeline has been
+consolidated into a single file that takes a `telescope='HST'|'JWST'` parameter
+internally, and `bp3m_run.py` has been fully migrated to call these merged
+modules unconditionally (no more if/else import branches at any call site).
+The old `_jwst`/`_cal` files (`download_jwst.py`, `psf_fitting_cal.py`,
+`cross_match_jwst.py` ×2, `validator_jwst.py`, `data_loader_cal.py`,
+`run_alignment_jwst.py`, `synthetic_jwst.py`) are left on disk, untouched and
+orphaned — nothing imports them anymore. See the per-module notes below for
+merge details.
+
+| Step | Module | What it does |
+|------|--------|--------------|
+| 1 | `download_gaia.py` | TAP query to Gaia DR3; caches as CSV (always shared) |
+| 2 | `download_hst.py` | MAST search + download; `telescope` param picks HST/JWST behaviour |
+| 3 | `psf_fitting.py` | Parallelises PSF fitting over images via multiprocessing; `telescope` param dispatches HST (pypass) vs JWST (jwst1pass_py_v2) internally |
+| 4 | `cross_match.py` | Parallelises `gaia_cross_match` over images; `telescope` param picks HST/JWST behaviour |
+| 5 | `run_alignment.py` | Calls `BP3MSolver` from `bp3m/solver.py`; `telescope` param passed through to the data loader |
+| 5a | `synthetic.py` | Optional: generate synthetic observations + pull tests; `telescope` param picks HST/JWST behaviour |
 
 Steps can be individually skipped with `--skip_download`, `--skip_psf`, `--skip_crossmatch`, `--skip_alignment`. An obsid manifest (`{field}_selected_obsids.json`) persists image selection across runs.
 
@@ -66,28 +76,37 @@ Observed in practice: the TAP job can actually finish server-side (visible as `I
 
 ### Telescope dispatch
 
-Step 2 dispatches on `--telescope`:
-- `HST` (default) → `download_hst_images()` using `--hst_im_type` (default `_flc`)
-- `JWST` → `download_jwst_images()` using `--jwst_im_type` (default `_cal`); supports NIRCam, NIRISS, MIRI
+Every step (2 through 5a) now takes `telescope='HST'|'JWST'` directly on its
+merged module's entry point, and `bp3m_run.py` imports each module
+unconditionally — no if/else branches at any call site. `_im_type` is resolved
+once at the start of `main()` (`args.jwst_im_type` for JWST, `args.hst_im_type`
+for HST) and threaded through everywhere.
 
-All steps dispatch on `--telescope HST|JWST` via if/else in `bp3m_run.py`. HST uses `_flc` images; JWST uses `_cal` images. `split_ccd` defaults to `False` for JWST throughout (ACS/WFC-chip-specific, not applicable to JWST detectors). `inflate_hst_errors` (per-image empirical covariance inflation; the "hst" in the name is legacy — it operates on generic per-image position covariance) now defaults to `True` for JWST as well, same as HST, controlled by `--no_inflate_hst_errors`.
+- Step 2: `download_hst_images()` in `download_hst.py`. `--hst_im_type` (default `_flc`) or `--jwst_im_type` (default `_cal`) passed through as `im_type`. JWST supports NIRCam, NIRISS, MIRI.
+- Step 3: `run_psf_fitting()` / `reclassify_psf_catalogs()` / `remeasure_psf_perturbation()` in `psf_fitting.py`. For JWST, `_fit_one_image` dispatches via `params['_telescope']` to `_fit_one_image_jwst`, which calls `jwst1pass_py_v2` and produces pypass-schema catalogs.
+- Step 4: `run_cross_match()` in `pipeline/cross_match.py`, and `process_single_image()` in `gaia_cross_match/cross_match.py`.
+- Step 5: `run_alignment()` in `run_alignment.py`; `telescope` is passed through to `data_loader_flc.load_image_data_flc`.
+- Step 5a: `generate_synthetic_data()` / `compare_synthetic_results()` / `run_conditional_solve()` in `synthetic.py`.
 
-**JWST PSF fitting**: `psf_fitting_cal.py` is the JWST entry point. `run_psf_fitting(telescope='JWST')` now calls `jwst1pass_py_v2` and produces pypass-schema catalogs; the `NotImplementedError` guard has been removed.
+HST uses `_flc` images; JWST uses `_cal` images. `split_ccd` defaults to `False` for JWST throughout (ACS/WFC-chip-specific, not applicable to JWST detectors). `inflate_hst_errors` (per-image empirical covariance inflation; the "hst" in the name is legacy — it operates on generic per-image position covariance) now defaults to `True` for JWST as well, same as HST, controlled by `--no_inflate_hst_errors`. The `NotImplementedError` guard for non-HST telescopes has been removed from every step.
 
 ### Additional pipeline modules
 
-- `pipeline/psf_fitting_cal.py` — JWST-only CAL entry point (HST uses `psf_fitting.py`). `run_psf_fitting` calls `_fit_one_image`, which is a thin wrapper around `_fit_one_image_jwst`. `_fit_one_image_jwst` computes `zero_point` per-image from `PIXAR_SR` (`ZP_AB = -2.5 * log10(PIXAR_SR × 1e6 / 3631)`), then calls `jwst1pass_py_v2.jwst1pass.io.run_photometry_fits` and writes a pypass-schema catalog via `_build_jwst_catalog_table`. Key helpers: `_ensure_jwst1pass()` — sys.path injection for jwst1pass_py_v2; `_build_jwst_catalog_table()` — column adapter (renames `q→qfit`, adds `mag_st_gdc`, `is_star_candidate`, `chip_ext`, `eps_psf`, `sigma_*_model`, floor metadata). `_JWST_DEFAULTS` are tuned for JWST CAL: `fmin_thresh=5.0`, `hmin=5`, `half_width=5`, `mag_limit=28.0` (vs. `psf_fitting.py`'s `_HST_DEFAULTS`: `fmin_thresh=100.0`, `hmin=4`, `half_width=3` for HST FLC).
+- `pipeline/psf_fitting.py` (merged HST+JWST, August 2026) — `run_psf_fitting`, `reclassify_psf_catalogs`, and `remeasure_psf_perturbation` all take `telescope='HST'|'JWST'` and this is what `bp3m_run.py` imports for both telescopes. For JWST, `_fit_one_image` dispatches (via `params['_telescope']`) to `_fit_one_image_jwst`, and `remeasure_psf_perturbation` dispatches to `_remeasure_psf_perturbation_jwst` — both full copies of the logic that used to live only in `psf_fitting_cal.py`. `_fit_one_image_jwst` computes `zero_point` per-image from `PIXAR_SR` (`ZP_AB = -2.5 * log10(PIXAR_SR × 1e6 / 3631)`), calls `jwst1pass_py_v2.jwst1pass.io.run_photometry_fits`, and writes a pypass-schema catalog via `_build_jwst_catalog_table`. New helpers `_ensure_jwst1pass()` and `_build_jwst_catalog_table()`, and a `_JWST_DEFAULTS` dict (`fmin_thresh=5.0`, `hmin=5`, `half_width=5`, `mag_limit=28.0`) alongside the existing `_HST_DEFAULTS` (`fmin_thresh=100.0`, `hmin=4`, `half_width=3`, `mag_st_max=28.0`). Fixed one latent bug found during the merge: `_effective_fmin()` used to raise `KeyError` on every JWST status-print call (looked up `_JWST_DEFAULTS['mag_st_max']`, a key that only exists in `_HST_DEFAULTS`) — silently swallowed by a broad `except Exception: break` at the call site, which just truncated the parallel-fitting status messages; now correctly reads `mag_limit` for JWST.
+- `pipeline/psf_fitting_cal.py` — **orphaned** (August 2026). No longer imported anywhere; superseded by `psf_fitting.py`'s `telescope='JWST'` branch.
 - `pipeline/hst_catalog_crossmatch.py` — Cross-match ALL HST sources between images (not just Gaia-matched ones). Three-phase: (1) within-filter, (2) cross-filter, (3) Gaia recovery. Outputs go to `hst_xmatch/`. Used by the v2 pipeline to build the master catalog for BP3M v2.
-- `pipeline/run_alignment_jwst.py` — JWST equivalent of `run_alignment.py`. Uses `data_loader_cal.load_image_data_flc`; defaults `split_ccd=False`, `inflate_hst_errors=True` (matches `run_alignment.py`). Otherwise identical solver flow to `run_alignment.py`.
+- `pipeline/run_alignment.py` (JWST support, August 2026) — `run_alignment()` takes `telescope='HST'|'JWST'`, passed through to `data_loader_flc.load_image_data_flc`. `split_ccd` default unchanged at `True` (HST); `bp3m_run.py` always passes an explicit `split_ccd=False if telescope=='JWST' else ...` at the call site regardless of the function default.
+- `pipeline/run_alignment_jwst.py` — **orphaned** (August 2026). No longer imported anywhere; superseded by `run_alignment.py`'s `telescope='JWST'` branch.
 - `pipeline/run_alignment_v2.py` — BP3M v2 alignment using `master_combined_v2.csv`. Adds HST-only sources (no Gaia prior) with a phased-inclusion callback (`V2AlignmentCallback`) that enables them after iteration `hst_enable_iter`. Writes to `BP3M_v2_results/`.
 - `pipeline/run_iterate_v2.py` — Entry point for `bp3m-v2`. Orchestrates: (1) initial master cross-match → (2) BP3M v2 alignment → (3) updated master cross-match; repeated `--n_refine` times.
 - `pipeline/data_loader_master.py` — Loads `master_combined_v2.csv` for BP3M v2. HST-only sources get synthetic negative Gaia IDs, flat position priors, and Michalik+100 mas/yr PM prior (treated as `gaia_2p`).
 - `pipeline/catalog_utils.py` — Gaia covariance construction, quality filtering, error inflation. `GAIA_REQUIRED_COLS` lists the 33 columns expected from a Gaia CSV.
 - `pipeline/explore_utils.py` — `load_gaia_catalog()`, `load_bp3m_results()` and other notebook helpers.
 - `pipeline/output.py` — `print_field_summary()`, `write_ds9_region_file()`.
-- `pipeline/synthetic.py` — Generates synthetic HST observations from real cross-match data; `compare_synthetic_results()` and `run_conditional_solve()` check recovered vs. truth PMs.
-- `pipeline/synthetic_jwst.py` — JWST equivalent of `synthetic.py`. Key differences: uses `jwst_index` (not `hst_index`), `data_loader_cal` (not `data_loader_flc`), `_mjd_from_cal` with `MJD-BEG`/`MJD-END` fallback, `split_ccd=False`. `inflate_hst_errors` defaults to `True`, matching `synthetic.py`.
-- `bp3m/data_loader_cal.py` — JWST data loader (parallel to `data_loader_flc.py` for HST). Reads `{img}_cal.fits` (with `EXPSTART`/`MJD-BEG` fallback), `{img}_cal_catalog.fits`, `matched_gaia.csv` (uses `jwst_index`), and `transformation.csv`. Directory root: `JWST/mastDownload/JWST/`. Public entry point: `load_image_data_flc(data_root, field_name)` — returns the same `(images, stars_per_image, gaia_catalog)` triple as the HST loader.
+- `pipeline/synthetic.py` (merged HST+JWST, August 2026) — `generate_synthetic_data()`, `compare_synthetic_results()`, and `run_conditional_solve()` all take `telescope='HST'|'JWST'` (added to `run_conditional_solve`, which had no such parameter in either original file — JWST worked before only because `bp3m_run.py` imported the whole separate `synthetic_jwst.py` module). `_mjd_from_flc()` and `_sky_to_pixel()` also take `telescope`. `im_type` default changed from a hardcoded `'_flc'` to `None`-resolved-by-telescope. Matched-Gaia index column branches `hst_index`/`jwst_index`. **Known pre-existing bug, deliberately left unfixed during this merge**: `_sky_to_pixel()`'s HST branch does `from miracle_match import rd2x, rd2y` — missing the `gaia_cross_match.` package prefix (no top-level `miracle_match` module exists; verified `ModuleNotFoundError` on import). `_ensure_fcm()` is a no-op and does not rescue this via sys.path. `_sky_to_pixel()` is called unconditionally inside `generate_synthetic_data()`'s per-image loop with no surrounding try/except, so **every HST synthetic-test run (`--test_synthetic` with `--telescope HST`, the default) should currently crash** at that point. The JWST branch (`from gaia_cross_match.miracle_match import rd2x, rd2y`) is correct. This bug predates the merge and was already present in `synthetic.py` before this session — it is now documented inline in the code with a comment, not fixed.
+- `pipeline/synthetic_jwst.py` — **orphaned** (August 2026). No longer imported anywhere; superseded by `synthetic.py`'s `telescope='JWST'` branch. Its `_sky_to_pixel()` has the correct import that `synthetic.py`'s HST branch is missing (see bug note above).
+- `bp3m/data_loader_flc.py` (merged HST+JWST, August 2026) — `_read_image_meta`, `_build_stars_df`, and the public `load_image_data_flc(data_root, field_name, pos_err_floor=..., telescope='HST')` all take `telescope`, and this is what `run_alignment.py`/`synthetic.py` import for both telescopes now. For JWST: image suffix `_cal.fits`/`_cal_catalog.fits`, `EXPSTART`/`EXPEND` fall back to `MJD-BEG`/`MJD-END` (HST requires them present, direct dict access), matched-Gaia index column is `jwst_index` (not `hst_index`), directory root `JWST/mastDownload/JWST/`. Function name `load_image_data_flc` is unchanged (both files already exported a same-named function pre-merge, just from different modules).
+- `bp3m/data_loader_cal.py` — **orphaned** (August 2026). No longer imported anywhere; superseded by `data_loader_flc.py`'s `telescope='JWST'` branch.
 - `bp3m/checkpointing.py` — Save/restore solver inputs and posterior arrays. Layout: `metadata.json`, `gaia_catalog.csv`, `hst_sources/<img>.csv`, `results/{r_hat,C_r,v_hat,v_mean,v_cov,...}.npy`.
 
 ### Core solver (`bp3m/solver.py`)
@@ -219,17 +238,19 @@ Table metadata keys: `SIGMA_FLOOR_X`, `SIGMA_FLOOR_Y`, `EPS_FLUX`, `ZP_AB` (when
 
 ### Cross-matching subpackage (`gaia_cross_match/`)
 
-- `cross_match.py` — HST implementation. `process_single_image()`: 4P offset discovery (2D histogram peak) → 6P affine refinement with per-iteration empirical residual covariance floor → final match. Uses `get_hst_params()` (reads `ORIENTAT`, ACS/WFC3 pixel scales from FLC headers). Outputs `hst_*` columns.
-- `cross_match_jwst.py` — JWST implementation. Same matching algorithm as `cross_match.py`. Key differences:
-  - `get_jwst_params()` — reads `PA_APER` (then `ORIENTAT`, then `PA_V3` as fallback) from the SCI extension; pixel scales from `_JWST_PIXEL_SCALE` dict (NIRCam SW 0.031″, LW 0.063″, NIRISS 0.066″, MIRI 0.111″); `initial_scale=1.0` (no GDC plate-scale correction needed)
-  - `find_hst_image_folders()` (modified) — walks `JWST/`, matches `{name}_cal_catalog.fits` + `*_cal.fits`; returns dicts with `cal` key instead of `flc`
-  - `process_single_image(img, ...)` — takes `img` dict with keys `root`, `catalog`, `cal`; outputs `jwst_*` columns and `is_star` flag
-  - HST-specific dead code removed: `_CHIP_CONFIG`, `get_chip_config`, `get_hst_params`
+- `cross_match.py` — merged HST+JWST implementation (August 2026; was two separate files). `process_single_image(img, ..., telescope='HST')`: 4P offset discovery (2D histogram peak) → 6P affine refinement with per-iteration empirical residual covariance floor → final match, shared verbatim between telescopes. Telescope-specific pieces:
+  - `get_hst_params(image_file, catalog_file=None, telescope='HST')` — for HST reads `ORIENTAT` + ACS/WFC3 pixel scales from FLC headers; for JWST (early-return branch) reads `PA_APER` (then `ORIENTAT`, then `PA_V3` as fallback) from the SCI extension, pixel scales from `_JWST_PIXEL_SCALE`/per-detector literals, `initial_scale` varies by detector (≈0.99–1.01) rather than the fixed `1.0` the old `cross_match_jwst.py` used
+  - `find_hst_image_folders(target, data_dir, telescope='HST')` — HST branch walks `HST/`, matches `*_flc_catalog.fits`; JWST branch walks `JWST/`, matches `*_cal_catalog.fits`; dict key is `flc` or `cal` accordingly
+  - Output columns: HST writes `hst_*` + `hst_is_star`; JWST writes `jwst_*` + plain `is_star` (not `jwst_is_star` — asymmetric, preserved intentionally since `validator.py`'s JWST branch expects `is_star`)
+  - `_CHIP_CONFIG`/`get_chip_config` (HST-only two-chip detector config) kept, used only on the HST branch
+- `cross_match_jwst.py` — **orphaned** (August 2026). No longer imported anywhere; superseded by `cross_match.py`'s `telescope='JWST'` branch. Left on disk untouched. One bug was found and fixed during the merge and does **not** carry over: its standalone `main()` imported `.validator` (HST) instead of `.validator_jwst`, so a JWST cross-image validation run via that CLI entry point would silently no-op (see `validator.py` note below).
 - `catalog_matcher.py` — nearest-neighbour matching with magnitude constraint
 - `miracle_match.py` — fallback robust geometric matching via V/VMAX + SNS + progressive sigma tightening
 - `diagnostics.py` — 8-panel per-image diagnostic plots
+- `validator.py` — merged HST+JWST cross-image validation (August 2026; was two separate files, `validator.py` + `validator_jwst.py`). `validate_target(target, data_dir, ..., telescope='HST')` and every helper it calls (`_science_filter`, `load_image_data`, `find_processed_images`, `has_valid_stmag`, `compute_pairwise_zps`, `validate_filter_group`, `write_solo_quality`, `build_global_catalog`) now take `telescope`. JWST output column asymmetry preserved: `is_star`/`jwst_index_list` (not `jwst_is_star`) vs HST's `hst_is_star`/`hst_index_list`.
+- `validator_jwst.py` — **orphaned** (August 2026), no longer imported anywhere; superseded by `validator.py`'s `telescope='JWST'` branch.
 
-**Hard catalog column requirements** (both cross_match.py and cross_match_jwst.py raise or skip without these):
+**Hard catalog column requirements** (both `cross_match.py` telescope branches raise or skip without these):
 
 | Column | Behaviour if missing |
 |--------|---------------------|
@@ -244,7 +265,11 @@ Table metadata keys: `SIGMA_FLOOR_X`, `SIGMA_FLOOR_Y`, `EPS_FLUX`, `ZP_AB` (when
 
 ### PSF fitting defaults
 
-`psf_fitting.py` `_HST_DEFAULTS` (tuned for HST FLC images):
+Both dicts below now live in `psf_fitting.py`, which is the live path for both
+telescopes (the orphaned `psf_fitting_cal.py` has an identical, unused copy of
+`_JWST_DEFAULTS` — see "Additional pipeline modules").
+
+`_HST_DEFAULTS` (tuned for HST FLC images):
 ```python
 fmin_thresh=100.0, mag_st_max=28.0, hmin=4, n_passes=2, n_discovery_passes=1,
 sat_threshold=60000.0, max_iter_fit=100, half_width=3,
@@ -253,7 +278,7 @@ sigma_clip=True, sigma_clip_sigma=4.0,
 conc_limit=0.9, n_jobs=-1, backend='auto'
 ```
 
-`psf_fitting_cal.py` `_JWST_DEFAULTS` (tuned for JWST CAL images):
+`_JWST_DEFAULTS` (tuned for JWST CAL images):
 ```python
 fmin_thresh=5.0, hmin=5, half_width=5, mag_limit=28.0,
 n_passes=2, sky_inner=4, sky_outer=8, conc_limit=0.9, n_jobs=-1
@@ -322,46 +347,36 @@ Stars are typed by which Gaia solution they have, checked in `solver.py::_cache_
 
 ### JWST status
 
+As of August 2026, JWST is fully wired through every pipeline step (2–5a), with
+`bp3m_run.py` calling the same merged modules for both telescopes. See "Pipeline
+flow" and "Telescope dispatch" above for the step-by-step summary; this section
+covers implementation depth and known gaps.
+
 **What is implemented:**
-- `download_jwst.py` — full MAST search + download for NIRCam, NIRISS, MIRI `_cal.fits`; reads available STDPSFs/STDGDCs from lib_dir to filter to supported filters; writes the same obsid manifest as the HST downloader; `_check_exptime()` validates exposure times
+- `download_hst.py` (merged HST+JWST, formerly also `download_jwst.py`) — full MAST search + download for NIRCam, NIRISS, MIRI `_cal.fits` via `telescope='JWST'`; reads available STDPSFs/STDGDCs from lib_dir to filter to supported filters; writes the same obsid manifest as the HST path; `_check_exptime()` validates exposure times (branches on telescope: HST checks `EXPTIME`/`EXPFLAG`/HDRLET presence, JWST checks `EFFEXPTM`/`ENG_QUAL`/`DATAPROB`/`VISITSTA`).
 - `jwst1pass_py_v2` (in `GaiaWebb-master/jwst1pass_py_v2/`) — JWST PSF-fitting engine, BP3M-compatible:
   - `StarRecord` carries `concentration`, `concentration_2x2`, `concentration_3x3`, `n_conc_1×1/2×2/3×3`, and `is_star_candidate` fields, matching pypass schema
   - `classify_stars()` and `_conc_adaptive_bounds()` are verbatim copies of the pypass implementations
   - `qfit` convention matches pypass: genuine quality metric (`small ≈ good`); old `qfit=0.0` sentinel removed
   - `conc_limit` threaded through `run_photometry_fits` → `_run_nircam_meta` → `run_photometry` → `classify_stars`
   - Validated on Draco NIRISS F200W: 81/515 star candidates correctly identified
-- **Step 3 PSF fitting (`psf_fitting_cal.py`)** — JWST-only module (July 2026):
-  - `_ensure_jwst1pass()` adds `GaiaWebb-master/jwst1pass_py_v2` to `sys.path` (respects `JWST1PASS_DIR` env var)
-  - `_build_jwst_catalog_table(records, zero_point, sigma_floor_x, sigma_floor_y, eps_flux, floor_params)` — column adapter from jwst1pass schema to pypass schema: `q→qfit`, `mag_gdc→mag_st_gdc`, adds `is_star_candidate`, `chip_ext`, `eps_psf=NaN`, `sigma_*_model=NaN`, floor metadata
-  - `_fit_one_image` — thin wrapper that delegates to `_fit_one_image_jwst`; accepts the same 7-tuple args as `_image_worker` for API compatibility
-  - `_fit_one_image_jwst()` — JWST engine: reads `PIXAR_SR` from the FITS primary header to compute `zero_point` (`ZP_AB = -2.5 * log10(PIXAR_SR × 1e6 / 3631)`), calls `jwst1pass_py_v2`, writes catalog, params sidecar, residual FITS (per-chip SCI/VAR/MASK with DQ + sigma-clip masks), all diagnostic plots, and PSF perturbation `psf_delta.npy`
-  - `estimate_systematic_floor` is called on jwst1pass records (uses covariance matrix entries, which jwst1pass computes); `fx/fy/ff` propagated to catalog and `plot_catalog_stats`
-  - Image discovery uses `download_jwst.find_flc_images`; `_JWST_DEFAULTS` provides all JWST-specific parameter defaults including `mag_limit=28.0`
+- **Step 3 PSF fitting** — merged into `psf_fitting.py` (see "Additional pipeline modules" for the `_effective_fmin` bug fixed during the merge). `_fit_one_image_jwst()` reads `PIXAR_SR` from the FITS primary header to compute `zero_point` (`ZP_AB = -2.5 * log10(PIXAR_SR × 1e6 / 3631)`), calls `jwst1pass_py_v2`, writes catalog, params sidecar, residual FITS (per-chip SCI/VAR/MASK with DQ + sigma-clip masks), all diagnostic plots, and PSF perturbation `psf_delta.npy`.
 
-- **Step 4 cross-matching (`gaia_cross_match/cross_match_jwst.py`)** — JWST implementation complete (July 2026):
-  - `get_jwst_params(cal_file)` reads `PA_APER`/`ORIENTAT` from SCI ext, pixel scale from `_JWST_PIXEL_SCALE`, `EXPSTART`/`MJD-BEG` from primary header; `initial_scale=1.0`
-  - `find_hst_image_folders()` walks `JWST/` and matches `*_cal_catalog.fits` + `*_cal.fits` (name kept for API compatibility with pipeline's `process_single_image` call)
-  - `process_single_image(img, ...)` — JWST-adapted: `img['cal']` instead of `hst['flc']`; outputs `jwst_index`, `jwst_x_gdc`, `jwst_y_gdc`, `jwst_mag_gdc`, `jwst_mag_st_gdc`, `jwst_mag_ab`, `is_star`
-  - `pipeline/cross_match_jwst.py` wired up (July 2026): imports `process_single_image` from `gaia_cross_match.cross_match_jwst`; uses `find_jwst_image_folders` for image discovery; `NotImplementedError` removed; defaults changed to `telescope='JWST'`, `im_type='_cal'`; validator uses `validator_jwst`
-  - `gaia_cross_match/__init__.py` now exports JWST symbols: `process_single_image_jwst`, `find_jwst_image_folders`, `get_jwst_params`, `load_gaia_data_jwst`, `propagate_gaia_with_cov_jwst`, `validate_target_jwst`
+- **Step 4 cross-matching** — merged into `gaia_cross_match/cross_match.py`. `get_hst_params(flc_file, catalog_file=None, telescope='JWST')` (param still named `flc_file` even for JWST calls) reads `PA_APER`/`ORIENTAT` from SCI ext, pixel scale from `_JWST_PIXEL_SCALE`, `EXPSTART`/`MJD-BEG` from primary header; `initial_scale` is now per-detector (≈0.99–1.01, derived from the WCS-measured pixel scales below) rather than the old fixed `1.0`. `find_hst_image_folders(telescope='JWST')` walks `JWST/` and matches `*_cal_catalog.fits` + `*_cal.fits`. `process_single_image(img, ..., telescope='JWST')` outputs `jwst_index`, `jwst_x_gdc`, `jwst_y_gdc`, `jwst_mag_gdc`, `jwst_mag_st_gdc`, `jwst_mag_ab`, `is_star`. `gaia_cross_match/__init__.py` no longer exports the old `_jwst`-suffixed symbols (`process_single_image_jwst`, `find_jwst_image_folders`, `get_jwst_params`, etc.) since the merged `cross_match.py` symbols cover both telescopes.
 
-- **Step 4 cross-image validation (`gaia_cross_match/validator_jwst.py`)** — JWST implementation complete (July 2026):
-  - `_science_filter(h0)`: reads `FILTER`/`PUPIL` from primary header; for NIRISS returns `PUPIL` when `FILTER == CLEAR` (matching `jwst1pass/io.py::_extract_filter`)
-  - `load_image_data()`: reads `*_cal.fits`; `INSTRUME`/`DETECTOR`/`FILTER` from primary header, `CRVAL1`/`CRVAL2` from SCI ext (`h[1]`)
-  - `find_processed_images()`: walks `JWST/`, matches `*_cal_catalog.fits`
-  - All column references updated: `jwst_mag_st_gdc`, `jwst_mag_err_gdc`, `jwst_index`, `jwst_index_list`, `is_star` (not `hst_is_star`)
-  - `validate_target()`, `build_global_catalog()`, `write_solo_quality()` all updated for JWST column names
-  - `gaia_cross_match/validator.py` (HST) is unchanged
+- **Step 4 cross-image validation** — merged into `gaia_cross_match/validator.py`. `_science_filter(h0, telescope='JWST')`: reads `FILTER`/`PUPIL` from primary header; for NIRISS returns `PUPIL` when `FILTER == CLEAR` (matching `jwst1pass/io.py::_extract_filter`). `load_image_data(telescope='JWST')`: reads `*_cal.fits`; `INSTRUME`/`DETECTOR`/`FILTER` from primary header, `CRVAL1`/`CRVAL2` from SCI ext (`h[1]`). `find_processed_images(telescope='JWST')`: walks `JWST/`, matches `*_cal_catalog.fits`. Column references branch correctly: `jwst_mag_st_gdc`, `jwst_mag_err_gdc`, `jwst_index`, `jwst_index_list`, `is_star` (not `hst_is_star`) for JWST vs `hst_*`/`hst_is_star`/`hst_index_list` for HST. Note: the orphaned `cross_match_jwst.py`'s standalone `main()` used to import the wrong validator (`.validator` instead of `.validator_jwst`) — fixed as a drive-by during the merge even though that file is no longer live, in case it's ever resurrected.
 
-- **`bp3m_run.py` JWST wiring (July 2026)**:
+- **Step 5 alignment / Step 5a synthetic** — merged into `run_alignment.py` and `synthetic.py`; see "Additional pipeline modules" for details, including the pre-existing `_sky_to_pixel()` import bug in `synthetic.py`'s HST branch (deliberately left unfixed).
+
+- **`bp3m_run.py` JWST wiring** — fully migrated (August 2026). No step has an `if args.telescope.upper() == 'JWST': import X_jwst else: import X` branch anymore; every step imports its merged module unconditionally and passes `telescope=args.telescope` (or `.upper()`) explicitly:
   - `_im_type` resolved once at start of `main()`: `args.jwst_im_type` for JWST, `args.hst_im_type` for HST; used in Steps 3, 4, and synthetic test
-  - Step 3: dispatches to `psf_fitting_cal.run_psf_fitting` for JWST, `psf_fitting.run_psf_fitting` for HST; `reclassify_psf_catalogs` and `remeasure_psf_perturbation` also dispatched
-  - Step 4: dispatches to `cross_match_jwst.run_cross_match` for JWST, `cross_match.run_cross_match` for HST
-  - Step 5: dispatches to `run_alignment_jwst.run_alignment` for JWST, `run_alignment.run_alignment` for HST; `split_ccd` forced to `False` for JWST in all call sites (`inflate_hst_errors` follows `--no_inflate_hst_errors` for both telescopes as of 2026-08-01)
-  - Step 5a: dispatches to `synthetic_jwst` for JWST, `synthetic` for HST; `_split_ccd_syn` and `_inflate_errors_syn` computed once and reused across synthetic sub-steps
-  - Steps 2 and manifest scanning already had telescope if/else before this session
+  - Step 2: `download_hst.download_hst_images`; failed-obsid rescan block (after Step 2) imports `_check_exptime` from the same module
+  - Step 3: `psf_fitting.{run_psf_fitting, reclassify_psf_catalogs, remeasure_psf_perturbation}`
+  - Step 4: `cross_match.run_cross_match`
+  - Step 5: `run_alignment.run_alignment`; `split_ccd` forced to `False` for JWST in all call sites (`inflate_hst_errors` follows `--no_inflate_hst_errors` for both telescopes as of 2026-08-01)
+  - Step 5a/5b/5c: `synthetic.{generate_synthetic_data, compare_synthetic_results, run_conditional_solve}`; `_split_ccd_syn` and `_inflate_errors_syn` computed once and reused across synthetic sub-steps
 
-- **`_JWST_PIXEL_SCALE` in `cross_match_jwst.py`** — nominal pixel scales (arcsec/px) used for initial Gaia projection; verified against real `_cal.fits` WCS CD matrices (July 2026):
+- **`_JWST_PIXEL_SCALE` in `cross_match.py`** (moved from the now-orphaned `cross_match_jwst.py`) — nominal pixel scales (arcsec/px) used for initial Gaia projection; verified against real `_cal.fits` WCS CD matrices (July 2026):
 
   | Key | Hardcoded | WCS measured | Notes |
   |-----|-----------|--------------|-------|
@@ -370,11 +385,11 @@ Stars are typed by which Gaia solution they have, checked in `solver.py::_cache_
   | `NIRISS` | 0.066 | 0.0653 | NIS |
   | `MIRI` | 0.111 | 0.1099–0.1105 | varies by dither pointing |
 
-  All within ~1% of WCS values. The 6P affine refinement absorbs the residual (visible as PIXEL-SCALE RATIO ≠ 1.0 in `xym2pm_GH` output).
+  All within ~1% of WCS values. `get_hst_params(..., telescope='JWST')` now encodes each detector's measured ratio directly as `initial_scale` (e.g. NRCA1=1.0073, NIRISS=0.9934, MIRI=0.9992) rather than leaving the full ~1% correction to the 6P affine refinement.
 
 **What is not yet implemented:**
-- `psf_fitting.py` (HST-only) — still raises `NotImplementedError` for non-HST; use `psf_fitting_cal.py` for JWST
 - PSF iteration (`n_psf_iter >= 2`) for JWST — `psf_delta` is not passed into `_fit_one_image_jwst`; `psf_delta.npy` is written for reference only
+- HST synthetic testing (`--test_synthetic` with `--telescope HST`, the default) is currently broken by the pre-existing `_sky_to_pixel()` import bug in `synthetic.py` — see "Additional pipeline modules". JWST synthetic testing is unaffected (its branch has the correct import).
 
 ### Notebooks
 

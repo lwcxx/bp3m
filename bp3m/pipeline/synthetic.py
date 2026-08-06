@@ -1,5 +1,5 @@
 """
-Step 6 (optional): Generate synthetic HST observations for BP3M end-to-end testing.
+Step 6 (optional): Generate synthetic HST/JWST observations for BP3M end-to-end testing.
 
 Requires a completed cross-match (Step 4).  No new downloads or PSF fitting.
 
@@ -18,8 +18,8 @@ Workflow
      all 5 astrometric parameters plus image transformation parameters, writes
      diagnostic plots and a synthetic_comparison.csv.
 
-Directory layout produced
--------------------------
+Directory layout produced (telescope='HST', default)
+------------------------------------------------------
 {output_dir}/{field}/synthetic/
     Gaia/
         {field}_synthetic_gaia.csv
@@ -33,6 +33,9 @@ Directory layout produced
         stellar_truth.csv
         image_truth.csv
     BP3M_results/                     — written by run_alignment after this step
+
+For telescope='JWST', the root is JWST/mastDownload/JWST/, files use '_cal' in
+place of '_flc', and matched_gaia.csv uses jwst_index instead of hst_index.
 """
 
 from __future__ import annotations
@@ -73,20 +76,32 @@ def _read_transform(img_dir: Path) -> dict | None:
 
 
 def _sky_to_pixel(ra: np.ndarray, dec: np.ndarray,
-                  t: dict) -> tuple[np.ndarray, np.ndarray]:
+                  t: dict, telescope: str = 'HST') -> tuple[np.ndarray, np.ndarray]:
     """
-    Map sky positions (degrees, at HST epoch) → GDC pixel coordinates.
+    Map sky positions (degrees, at the observation epoch) → GDC pixel coordinates.
 
-    Mirrors the exact pipeline used by cross_match_cli.py:
+    Mirrors the exact pipeline used by cross_match.py:
       1. Gnomonic projection to nominal pixel frame centred at (x_cen, y_cen)
-      2. Initial inverse rotation by ORIENTAT to align with HST detector axes
+      2. Initial inverse rotation by ORIENTAT (HST) / PA_APER (JWST) to align
+         with the detector axes
       3. Invert A,B,C,D affine transform to obtain GDC pixel (x, y)
 
     The A,B,C,D values in transformation.csv capture ONLY the residual
-    distortion after the initial ORIENTAT rotation has been applied.
+    distortion after the initial rotation has been applied.
     """
     _ensure_fcm()
-    from miracle_match import rd2x, rd2y
+    if telescope == 'JWST':
+        from gaia_cross_match.miracle_match import rd2x, rd2y
+    else:
+        # KNOWN BUG (pre-existing, not introduced by this merge): this import
+        # is missing the 'gaia_cross_match.' package prefix. There is no
+        # top-level 'miracle_match' module, so this raises ModuleNotFoundError
+        # whenever _sky_to_pixel() is actually called for telescope='HST'
+        # (i.e. every HST synthetic-test run). _ensure_fcm() is a no-op and
+        # does not add gaia_cross_match/ to sys.path, so it doesn't rescue this
+        # either. The JWST branch above has the correct import. Left as-is
+        # per instruction — not fixed during this merge.
+        from miracle_match import rd2x, rd2y
 
     scale_deg = t["pixel_scale"] / 3600.0          # arcsec/pix → deg/pix
 
@@ -111,10 +126,14 @@ def _sky_to_pixel(ra: np.ndarray, dec: np.ndarray,
     return t["xs_o"] + dxy_hst[:, 0], t["ys_o"] + dxy_hst[:, 1]
 
 
-def _mjd_from_flc(flc_path: Path) -> float:
-    """Mid-exposure MJD from FLC FITS primary header."""
+def _mjd_from_flc(flc_path: Path, telescope: str = 'HST') -> float:
+    """Mid-exposure MJD from FLC/CAL FITS primary header."""
     with afits.open(flc_path, memmap=False) as hdu:
         h = hdu[0].header
+        if telescope == 'JWST':
+            exp_start = float(h.get("EXPSTART", h.get("MJD-BEG", 51544.0)))
+            exp_end   = float(h.get("EXPEND",   h.get("MJD-END", exp_start)))
+            return 0.5 * (exp_start + exp_end)
         return 0.5 * (float(h["EXPSTART"]) + float(h["EXPEND"]))
 
 
@@ -233,7 +252,7 @@ def generate_synthetic_data(
     output_dir: Path,
     field_name: str,
     telescope: str = "HST",
-    im_type: str = "_flc",
+    im_type: str | None = None,
     seed: int = 42,
     draw_from_prior: bool = False,
     zero_parallax: bool = False,
@@ -250,14 +269,14 @@ def generate_synthetic_data(
     syn_name: str = "synthetic",
 ) -> Path:
     """
-    Generate synthetic HST observations and write a synthetic data tree.
+    Generate synthetic HST/JWST observations and write a synthetic data tree.
 
     Parameters
     ----------
     output_dir       : pipeline root (parent of field_name/)
     field_name       : field subdirectory
-    telescope        : 'HST'
-    im_type          : '_flc' or '_flt'
+    telescope        : 'HST' or 'JWST'
+    im_type          : image suffix. Defaults to '_flc' for HST, '_cal' for JWST when None.
     seed             : RNG seed for reproducibility
     draw_from_prior  : if True, draw true stellar params from Gaia prior N(v,C)
                        instead of using the Gaia MAP values directly
@@ -301,6 +320,9 @@ def generate_synthetic_data(
     """
     rng = np.random.default_rng(seed)
 
+    if im_type is None:
+        im_type = '_cal' if telescope.upper() == 'JWST' else '_flc'
+
     output_dir = Path(output_dir)
     field_path = output_dir / field_name
     tel_upper  = telescope.upper()
@@ -328,7 +350,7 @@ def generate_synthetic_data(
 
     # ── Inventory image directories ───────────────────────────────────────────
     if not hst_root.exists():
-        raise FileNotFoundError(f"HST root not found: {hst_root}")
+        raise FileNotFoundError(f"{telescope} root not found: {hst_root}")
     img_dirs = sorted(p for p in hst_root.iterdir() if p.is_dir())
     if images is not None:
         keep = set(images)
@@ -379,7 +401,7 @@ def generate_synthetic_data(
         all_gaia_ids.update(match["gaia_source_id"].values)
         per_image[img_name] = dict(
             img_dir=img_dir, flc_path=flc_path, cat_path=cat_path,
-            transform=t, mjd=_mjd_from_flc(flc_path),
+            transform=t, mjd=_mjd_from_flc(flc_path, telescope=telescope),
             match=match,
             cat_cov_xx=cat_cov_xx, cat_cov_yy=cat_cov_yy, cat_cov_xy=cat_cov_xy,
         )
@@ -604,7 +626,8 @@ def generate_synthetic_data(
         match    = info["match"].copy()
         t        = info["transform"]
         mjd      = info["mjd"]
-        hst_idx  = match["hst_index"].to_numpy(int)
+        idx_col  = 'jwst_index' if telescope.upper() == 'JWST' else 'hst_index'
+        hst_idx  = match[idx_col].to_numpy(int)
         gaia_ids = match["gaia_source_id"].to_numpy(np.int64)
 
         rows_true = np.array([id_to_row.get(int(gid), -1) for gid in gaia_ids])
@@ -627,7 +650,7 @@ def generate_synthetic_data(
         ra_p, dec_p = _propagate(df_prop, mjd)
 
         # Forward model sky → pixel
-        x_pred, y_pred = _sky_to_pixel(ra_p, dec_p, t_fwd)
+        x_pred, y_pred = _sky_to_pixel(ra_p, dec_p, t_fwd, telescope=telescope)
 
         # Compute Gaia pseudo-image coords (what BP3M uses as the 'observed' xys)
         # using the same plane_project call as solver.py.
@@ -882,6 +905,7 @@ def run_conditional_solve(
     output_dir: Path,
     field_name: str,
     syn_name: str = "synthetic",
+    telescope: str = "HST",
     split_ccd: bool = True,
     min_stars_split_ccd: int = 20,
     poly_order: int = 1,
@@ -915,7 +939,8 @@ def run_conditional_solve(
 
     # ── Build solver from synthetic data ─────────────────────────────────────
     data_root = field_path
-    imgs, stars_per_image, gaia_catalog = load_image_data_flc(data_root, syn_name)
+    imgs, stars_per_image, gaia_catalog = load_image_data_flc(
+        data_root, syn_name, telescope=telescope)
     star_id_to_idx, image_names, star_in_image = build_index_maps(
         stars_per_image, gaia_catalog)
 
