@@ -367,7 +367,15 @@ class BP3MSolver:
 
             # Parallax factors: difference between HST epoch and Gaia epoch
             #Gaia has already removed the parallax, so no need to subtract plx at J2016
-            tele_xyz = get_tele_position(hst_time,curr_id='earth')
+            # For JWST, use the spacecraft's own barycentric position (JWST_X/Y/Z
+            # from the SCI header, near Sun-Earth L2) rather than Earth's, since
+            # the two differ by ~1.5e6 km. Falls back to Earth's position for HST
+            # or if the header keywords weren't available.
+            tele_xyz_jwst = meta.get('tele_xyz_jwst')
+            if tele_xyz_jwst is not None:
+                tele_xyz = tele_xyz_jwst
+            else:
+                tele_xyz = get_tele_position(hst_time,curr_id='earth')
             meta['tele_XYZ'] = tele_xyz
             d_plx_ra,  d_plx_dec  = get_parallax_factors(ra_g, dec_g, tele_xyz)
 

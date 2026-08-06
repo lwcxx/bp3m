@@ -55,6 +55,9 @@ _MIN_POS_ERR_PX: float = 5e-3
 # Phase 2 EM loop through residual-based tests.
 _MAX_SAT_FRAC: float = 0.25
 
+# IAU-defined astronomical unit, for converting JWST_X/Y/Z header values (km) to AU.
+_KM_PER_AU: float = 149597870.7
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -140,6 +143,19 @@ def _read_image_meta(img_dir: Path, img_name: str, telescope: str = 'HST') -> di
         cd21 = float(h1["CD2_1"]); cd22 = float(h1["CD2_2"])
         real_pixel_scale_mas = _pixel_scale_from_cd(cd11, cd12, cd21, cd22)
 
+        # JWST spacecraft barycentric position (SCI header), used in place of
+        # Earth's barycentric position for the parallax factor: JWST orbits
+        # near Sun-Earth L2 (~1.5e6 km from Earth), so using Earth's position
+        # instead introduces a small but avoidable systematic in the parallax
+        # factor. Not present in HST headers.
+        tele_xyz_jwst = None
+        if telescope == 'JWST' and all(k in h1 for k in ("JWST_X", "JWST_Y", "JWST_Z")):
+            tele_xyz_jwst = np.array([
+                float(h1["JWST_X"]) / _KM_PER_AU,
+                float(h1["JWST_Y"]) / _KM_PER_AU,
+                float(h1["JWST_Z"]) / _KM_PER_AU,
+            ])
+
     # ── transformation.csv ───────────────────────────────────────────────────
     tdf = pd.read_csv(tran_path).set_index("parameter")["value"]
 
@@ -175,6 +191,9 @@ def _read_image_meta(img_dir: Path, img_name: str, telescope: str = 'HST') -> di
         "off_skew": off_skew,
         # Timing
         "hst_time_mjd": hst_time_mjd,
+        # JWST barycentric spacecraft position (AU, ICRS) from SCI header;
+        # None for HST or if the header keywords are absent.
+        "tele_xyz_jwst": tele_xyz_jwst,
         # Instrument
         "instrument": instrument,
         "detector":   detector,

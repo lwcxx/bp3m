@@ -95,6 +95,9 @@ _JWST_PIXEL_SCALE = {
     'MIRI':      0.111,
 }
 
+# IAU-defined astronomical unit, for converting JWST_X/Y/Z header values (km) to AU.
+_KM_PER_AU = 149597870.7
+
 
 def get_hst_params(flc_file, catalog_file=None, telescope='HST'):
     if telescope == 'JWST':
@@ -169,6 +172,18 @@ def get_hst_params(flc_file, catalog_file=None, telescope='HST'):
             exp_end   = hdr0.get('EXPEND',   hdr0.get('MJD-END', exp_start))
             expstart  = 0.5 * (exp_start + exp_end)
 
+            # JWST spacecraft barycentric position (SCI header), used in place
+            # of Earth's barycentric position for the parallax factor: JWST
+            # orbits near Sun-Earth L2 (~1.5e6 km from Earth), so using Earth's
+            # position instead introduces a small but avoidable systematic.
+            tele_xyz = None
+            if all(k in sci_hdr for k in ("JWST_X", "JWST_Y", "JWST_Z")):
+                tele_xyz = np.array([
+                    sci_hdr['JWST_X'] / _KM_PER_AU,
+                    sci_hdr['JWST_Y'] / _KM_PER_AU,
+                    sci_hdr['JWST_Z'] / _KM_PER_AU,
+                ])
+
         return {
             'ra_cen':        ra_cen,
             'dec_cen':       dec_cen,
@@ -183,6 +198,7 @@ def get_hst_params(flc_file, catalog_file=None, telescope='HST'):
             'instrument':    instrume,
             'detector':      detector,
             'chip_dims':     {1: (naxis1, naxis2)},
+            'tele_xyz':      tele_xyz,
         }
 
     with fits.open(flc_file) as hdul:
@@ -301,7 +317,16 @@ def construct_gaia_cov(df, zero_pm=False):
 
     return covs
 
-def propagate_gaia_with_cov(df, target_mjd, zero_pm=False):
+def propagate_gaia_with_cov(df, target_mjd, zero_pm=False, tele_xyz=None):
+    """
+    tele_xyz : optional (3,) array of barycentric (X,Y,Z) in AU (ICRS) to use as
+        the parallax baseline instead of Earth's position — e.g. JWST_X/Y/Z read
+        from the image's SCI header. JWST orbits near Sun-Earth L2 (~1.5e6 km
+        from Earth), so using Earth's position instead introduces a small but
+        avoidable systematic in the parallax factor. Defaults to Earth's
+        barycentric position at target_mjd when not provided (HST, or JWST
+        images missing the header keywords).
+    """
     ref_epoch = df['ref_epoch'].iloc[0] if 'ref_epoch' in df.columns else 2016.0
     t_hst = Time(target_mjd, format='mjd')
     dt = (t_hst.jyear - ref_epoch)
@@ -315,8 +340,11 @@ def propagate_gaia_with_cov(df, target_mjd, zero_pm=False):
         plx = df['parallax'].fillna(0.0).values
         pmra, pmdec = df['pmra'].fillna(0.0).values, df['pmdec'].fillna(0.0).values
 
-    with solar_system_ephemeris.set('builtin'): earth_pos = get_body_barycentric('earth', t_hst)
-    X, Y, Z = earth_pos.x.to_value('au'), earth_pos.y.to_value('au'), earth_pos.z.to_value('au')
+    if tele_xyz is not None:
+        X, Y, Z = tele_xyz
+    else:
+        with solar_system_ephemeris.set('builtin'): earth_pos = get_body_barycentric('earth', t_hst)
+        X, Y, Z = earth_pos.x.to_value('au'), earth_pos.y.to_value('au'), earth_pos.z.to_value('au')
     p_ra_cosdec = X * np.sin(ra) - Y * np.cos(ra)
     p_dec = X * np.cos(ra) * np.sin(dec) + Y * np.sin(ra) * np.sin(dec) - Z * np.cos(dec)
     ra_off_mas, dec_off_mas = (pmra * dt + plx * p_ra_cosdec), (pmdec * dt + plx * p_dec)
@@ -823,7 +851,8 @@ def process_single_image(img, gaia_df, hst_pix_floor=0.01, min_matches=3, zero_p
         params['min_matches'] = min_matches
 
         # --- Propagate Gaia to the observation epoch and project to pixel frame ---
-        ra_prop, dec_prop, Ct = propagate_gaia_with_cov(gaia_df, params['obs_epoch_mjd'], zero_pm=zero_pm)
+        ra_prop, dec_prop, Ct = propagate_gaia_with_cov(gaia_df, params['obs_epoch_mjd'], zero_pm=zero_pm,
+                                                          tele_xyz=params.get('tele_xyz'))
         dx_deg_full = rd2x(ra_prop, dec_prop, params['ra_cen'], params['dec_cen'])
         dy_deg_full = rd2y(ra_prop, dec_prop, params['ra_cen'], params['dec_cen'])
         scale_deg = params['pixel_scale'] / 3600.0
