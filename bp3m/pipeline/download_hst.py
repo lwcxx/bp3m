@@ -35,6 +35,18 @@ _INSTRUMENTS = {
     'JWST': ['NIRCAM', 'NIRISS', 'MIRI'],
 }
 
+# MAST's instrument_name field for JWST is mode-qualified (e.g. 'NIRCAM/IMAGE'),
+# not the bare instrument name — querying with the bare name matches nothing
+# (verified: instrument_name=['MIRI'] returns 0 rows, ['MIRI/IMAGE'] returns
+# thousands). Used only when building the Observations.query_criteria() call;
+# every other JWST code path (available_combos, _INST_TO_LIBDIR, the
+# instrument_name post-filter below) keeps using the bare name.
+_JWST_INSTRUMENT_NAME_MAST = {
+    'NIRCAM': 'NIRCAM/IMAGE',
+    'NIRISS': 'NIRISS/IMAGE',
+    'MIRI':   'MIRI/IMAGE',
+}
+
 # Map MAST instrument_name → STDPSFs/STDGDCs subdirectory name
 # NIRCam uses mixed-case 'NIRCam' on disk to match the STScI directory naming.
 _INST_TO_LIBDIR = {
@@ -334,6 +346,8 @@ def search_mast(
             t_max_mjd = (Time.now()-366*u.day).mjd
 
     print(f"  Querying MAST (this can take a minute)...")
+    query_inst = ([_JWST_INSTRUMENT_NAME_MAST.get(i, i) for i in allowed_inst]
+                  if telescope == 'JWST' else allowed_inst)
     import time as _time
     _mast_retries = 5
     _mast_delay   = 10  # seconds between retries
@@ -344,7 +358,7 @@ def search_mast(
                 obs_collection=[telescope],
                 s_ra=[ra1, ra2],
                 s_dec=[dec1, dec2],
-                instrument_name=allowed_inst,
+                instrument_name=query_inst,
                 t_max=[t_min_bound, t_max_mjd],
                 filters=hst_filters,
                 project=project,

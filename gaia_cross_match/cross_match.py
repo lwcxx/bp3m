@@ -12,7 +12,6 @@ from astropy.io import fits
 from astropy.table import Table
 from astropy.time import Time
 from astropy.coordinates import get_body_barycentric, solar_system_ephemeris
-from astroquery.jplhorizons import Horizons
 from scipy.spatial import KDTree
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from .miracle_match import miracle_match, rd2x, rd2y
@@ -96,6 +95,9 @@ _JWST_PIXEL_SCALE = {
     'MIRI':      0.111,
 }
 
+# IAU-defined astronomical unit, for converting JWST_X/Y/Z header values (km) to AU.
+_KM_PER_AU = 149597870.7
+
 
 def get_hst_params(flc_file, catalog_file=None, telescope='HST'):
     if telescope == 'JWST':
@@ -170,21 +172,17 @@ def get_hst_params(flc_file, catalog_file=None, telescope='HST'):
             exp_end   = hdr0.get('EXPEND',   hdr0.get('MJD-END', exp_start))
             expstart  = 0.5 * (exp_start + exp_end)
 
-            # JWST spacecraft barycentric position, used in place of Earth's
-            # barycentric position for the parallax factor: JWST orbits near
-            # Sun-Earth L2 (~1.5e6 km from Earth), so using Earth's position
-            # instead introduces a small but avoidable systematic. Queried
-            # from JPL Horizons at the image's mid-exposure epoch (AU, ICRS).
+            # JWST spacecraft barycentric position (SCI header), used in place
+            # of Earth's barycentric position for the parallax factor: JWST
+            # orbits near Sun-Earth L2 (~1.5e6 km from Earth), so using Earth's
+            # position instead introduces a small but avoidable systematic.
             tele_xyz = None
-            if 'MJD-AVG' in sci_hdr:
-                try:
-                    ave_exp_jd = Time(sci_hdr['MJD-AVG'], format='mjd').jd
-                    obj = Horizons(id='jwst', location='@ssb', epochs=ave_exp_jd)
-                    vec = obj.vectors(aberrations='geometric', refplane='earth')
-                    tele_xyz = np.array([vec['x'][0], vec['y'][0], vec['z'][0]])
-                except Exception as e:
-                    warnings.warn(f"JPL Horizons query for JWST position failed ({e}); "
-                                   f"falling back to Earth's barycentric position.")
+            if all(k in sci_hdr for k in ("JWST_X", "JWST_Y", "JWST_Z")):
+                tele_xyz = np.array([
+                    sci_hdr['JWST_X'] / _KM_PER_AU,
+                    sci_hdr['JWST_Y'] / _KM_PER_AU,
+                    sci_hdr['JWST_Z'] / _KM_PER_AU,
+                ])
 
         return {
             'ra_cen':        ra_cen,

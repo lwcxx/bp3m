@@ -23,8 +23,12 @@ bp3m --name "Leo I" --search_radius 0.1 --output_dir ./outputs
 # Run v2 pipeline (adds HST-only sources via master cross-match)
 bp3m-v2 --name "Leo I" --output_dir ./outputs
 
-# Download PSF/GDC library files from STScI (one-time setup)
+# Download PSF/GDC library files from STScI (one-time setup; HST by default)
 bp3m-setup
+
+# Also/instead download the JWST library (NIRCam/NIRISS/MIRI; NIRCam GDCs are several GB)
+bp3m-setup --telescope JWST
+bp3m-setup --telescope both
 
 # Install notebooks into a target directory
 bp3m-notebooks
@@ -390,6 +394,22 @@ covers implementation depth and known gaps.
 **What is not yet implemented:**
 - PSF iteration (`n_psf_iter >= 2`) for JWST — `psf_delta` is not passed into `_fit_one_image_jwst`; `psf_delta.npy` is written for reference only
 - HST synthetic testing (`--test_synthetic` with `--telescope HST`, the default) is currently broken by the pre-existing `_sky_to_pixel()` import bug in `synthetic.py` — see "Additional pipeline modules". JWST synthetic testing is unaffected (its branch has the correct import).
+
+### Library setup (`bp3m-setup` / `bp3m/setup.py`)
+
+`bp3m-setup` downloads the STDPSF/STDGDC reference library from Jay Anderson's STScI pages. As of August 2026 it supports both telescopes:
+
+- `--telescope {HST,JWST,both}` — default `HST` (unchanged, for backward compatibility). JWST is opt-in since NIRCam GDCs alone total several GB.
+- `--instruments` — HST instrument list (unchanged: `ACSWFC ACSHRC WFC3UV WFC3IR`).
+- `--jwst-instruments` — JWST instrument list, default all of `NIRCam NIRISS MIRI`. Source: `https://www.stsci.edu/~jayander/JWST1PASS/LIB`.
+
+**Filenames are discovered by scraping the server's directory listing (`_list_fits`/`_list_dirs`), never guessed from a fixed template.** This matters because STScI is inconsistent about NIRCam STDPSF/STDGDC filename token order: most filters publish `STD{X}_{detector}_{filter}.fits`, but a few (confirmed: GDCs for `F210M`, `F070W` under `NIRCam/SWC`) are published the other way round, `STD{X}_{filter}_{detector}.fits`. A downloader that assumes one fixed order 404s on those filters — and a prior, non-bp3m download of this library did exactly that, silently saving the resulting HTML 404 page to disk with a `.fits` extension (17 corrupted files found in `GaiaWebb-master/lib/STDGDCs/NIRCam/`, all in `F210M`/`F070W`), which later crashed `jwst1pass_py_v2.io.load_stdgdc()` deep inside PSF fitting with `OSError: No SIMPLE card found`.
+
+Two fixes in `setup.py` address this:
+1. `_canonical_nircam_name(kind, basename)` parses the detector (`NRCA1`–`NRCB4`, `NRCAL`/`NRCBL`) and filter tokens out of whatever name the server actually used, and always **saves** the file locally as `STD{kind}_{detector}_{filter}.fits` — the fixed order `find_gdc()`/`find_psf()` in `jwst1pass_py_v2/jwst1pass/io.py` construct when looking a file up. So the on-disk name is always canonical even when the upstream name isn't.
+2. `_download()` now checks the downloaded content actually starts with the FITS `SIMPLE` magic bytes before committing it to `dest`; anything else (error page, truncated transfer) is treated as a failed download and the temp file is discarded, rather than being saved as if it were real data.
+
+`_download_jwst_group()` handles NIRCam's two possible layouts generically — SWC is split into per-filter subdirectories, LWC is flat — by trying to list filter subdirectories first and falling back to listing `.fits` files directly if none are found, so it doesn't hardcode which channel has which layout.
 
 ### Notebooks
 
